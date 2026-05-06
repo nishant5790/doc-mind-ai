@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docmind-api
+  namespace: docmind
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: docmind-api}}
+  template:
+    metadata:
+      labels: {app: docmind-api, azure.workload.identity/use: "true"}
+    spec:
+      serviceAccountName: docmind-sa
+      containers:
+        - name: api
+          image: REPLACE_ACR.azurecr.io/docmind-api:latest
+          imagePullPolicy: Always
+          ports: [{containerPort: 8000}]
+          envFrom:
+            - configMapRef: {name: docmind-config}
+            - secretRef: {name: docmind-secrets}
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 15
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 5
+          resources:
+            requests: {cpu: 200m, memory: 512Mi}
+            limits:   {cpu: 1000m, memory: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: docmind-api, namespace: docmind}
+spec:
+  selector: {app: docmind-api}
+  ports: [{port: 8000, targetPort: 8000}]

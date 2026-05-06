@@ -1,0 +1,13 @@
+# Workload Identity — let pods authenticate to Azure with no secrets.
+# Replace placeholders with your AKS workload identity setup:
+#   az identity create -g <rg> -n docmind-uami
+#   az identity federated-credential create ...
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: docmind-sa
+  namespace: docmind
+  annotations:
+    azure.workload.identity/client-id: REPLACE_USER_ASSIGNED_CLIENT_ID
+  labels:
+    azure.workload.identity/use: "true"

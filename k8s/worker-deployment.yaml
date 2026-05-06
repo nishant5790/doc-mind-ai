@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docmind-worker
+  namespace: docmind
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: docmind-worker}}
+  template:
+    metadata:
+      labels: {app: docmind-worker, azure.workload.identity/use: "true"}
+    spec:
+      serviceAccountName: docmind-sa
+      containers:
+        - name: worker
+          image: REPLACE_ACR.azurecr.io/docmind-api:latest
+          imagePullPolicy: Always
+          command: ["python", "worker.py"]
+          envFrom:
+            - configMapRef: {name: docmind-config}
+            - secretRef: {name: docmind-secrets}
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits:   {cpu: 2000m, memory: 2Gi}

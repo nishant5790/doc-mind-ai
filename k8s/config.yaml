@@ -1,0 +1,36 @@
+# Non-secret config. Real secrets (Cosmos key, OpenAI key, Doc Intel key, SAS) belong in a Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: docmind-config
+  namespace: docmind
+data:
+  AZURE_SEARCH_SERVICE_ENDPOINT: "https://agent-ai-search5yc2.search.windows.net"
+  AZURE_SEARCH_INDEX_NAME: "pdg-was-multimodal-rag-1"
+  AZURE_STORAGE_ACCOUNT_NAME: "pdgrag"
+  AZURE_BLOB_CONTAINER_NAME: "sgp-dload05s-ra-input"
+  AZURE_OPENAI_ENDPOINT: "https://azr-oai-dai-sandbox4-001.openai.azure.com/"
+  EMBEDDING_ENGINE: "text-embedding-ada-002"
+  GPT_ENGINE: "gpt-4o"
+  AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: "https://azdocumentai.cognitiveservices.azure.com/"
+  COSMOS_ENDPOINT: "https://db-ragtp4omni.documents.azure.com:443/"
+  COSMOS_DATABASE: "docmind"
+  DOCMIND_DISABLE_AUTH: "false"
+---
+# Replace placeholders, then:
+#   kubectl create secret generic docmind-secrets -n docmind \
+#     --from-literal=AZURE_OPENAI_KEY=... \
+#     --from-literal=AZURE_DOCUMENT_INTELLIGENCE_KEY=... \
+#     --from-literal=COSMOS_KEY=... \
+#     --from-literal=AZURE_SEARCH_ADMIN_KEY=...
+apiVersion: v1
+kind: Secret
+metadata:
+  name: docmind-secrets
+  namespace: docmind
+type: Opaque
+stringData:
+  AZURE_OPENAI_KEY: REPLACE
+  AZURE_DOCUMENT_INTELLIGENCE_KEY: REPLACE
+  COSMOS_KEY: REPLACE
+  AZURE_SEARCH_ADMIN_KEY: REPLACE
