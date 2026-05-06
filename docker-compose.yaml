@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    container_name: docmind-api
+    env_file: .env
+    ports: ["8000:8000"]
+    volumes:
+      - state:/app/data
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  worker:
+    build: .
+    container_name: docmind-worker
+    env_file: .env
+    volumes:
+      - state:/app/data
+    command: ["python", "worker.py"]
+    depends_on: [api]
+
+  ui:
+    build: ./frontend
+    container_name: docmind-ui
+    ports: ["3000:80"]
+    depends_on: [api]
+
+volumes:
+  state: {}
