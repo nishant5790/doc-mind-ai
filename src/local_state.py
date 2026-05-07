@@ -217,3 +217,18 @@ class LocalStateService:
                 self._data[k] = {}
             self._save()
         return counts
+
+    # ===== full wipe =====
+    def wipe_all(self) -> dict:
+        """Reset every container to empty and remove the on-disk state file."""
+        with self._lock:
+            counts = {k: len(v) for k, v in self._data.items()}
+            for k in list(self._data.keys()):
+                self._data[k] = {}
+            try:
+                if self._path.exists():
+                    self._path.unlink()
+            except Exception:
+                log.exception("Failed to remove local state file %s", self._path)
+            self._save()
+        return counts

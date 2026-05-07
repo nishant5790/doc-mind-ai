@@ -258,6 +258,43 @@ class CosmosService:
             counts[name] = n
         return counts
 
+    # ===== full wipe =====
+    def wipe_all(self) -> dict:
+        """Delete every item from every container managed by this service."""
+        targets = [
+            (config.COSMOS_CONTAINER_SESSIONS, "session_id"),
+            (config.COSMOS_CONTAINER_DOCUMENTS, "user_id"),
+            (config.COSMOS_CONTAINER_FEEDBACK, "session_id"),
+            (config.COSMOS_CONTAINER_RULES, "category"),
+            (config.COSMOS_CONTAINER_GOLDEN, "topic"),
+            (config.COSMOS_CONTAINER_CHUNK_QUALITY, "chunk_id"),
+            (config.COSMOS_CONTAINER_TASKS, "status"),
+        ]
+        counts: dict[str, int] = {}
+        for name, pk_field in targets:
+            try:
+                c = self._container(name)
+            except Exception as e:  # noqa: BLE001
+                log.warning("wipe_all: container %s not available: %s", name, e)
+                counts[name] = 0
+                continue
+            items = list(
+                c.query_items(
+                    query=f"SELECT c.id, c.{pk_field} AS pk FROM c",
+                    enable_cross_partition_query=True,
+                )
+            )
+            n = 0
+            for it in items:
+                try:
+                    c.delete_item(item=it["id"], partition_key=it.get("pk"))
+                    n += 1
+                except Exception as e:  # noqa: BLE001
+                    log.warning("wipe_all delete from %s failed for %s: %s", name, it.get("id"), e)
+            counts[name] = n
+        return counts
+
+
 # ---------------------------------------------------------------------------
 # Factory - pick Cosmos when configured, else use the local file backend.
 # ---------------------------------------------------------------------------

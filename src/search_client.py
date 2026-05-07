@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from typing import Optional
+import json
 
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
@@ -132,9 +133,10 @@ class SearchService:
             top=top_k,
             select=["id", "doc_id", "page", "type", "content", "image_url"],
         )
-
+        
         sources: list[Source] = []
         for r in results:
+            log.debug("Raw search result: %s", r)
             sources.append(
                 Source(
                     chunk_id=r["id"],
