@@ -1,11 +1,26 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: docmind-redis
+    ports: ["6379:6379"]
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
   api:
     build: .
     container_name: docmind-api
     env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      # Wipe all persistent state (local JSON, Redis, AI Search index, blobs,
+      # Cosmos containers if configured) every time the api container starts.
+      # Set to "false" to preserve state across restarts.
+      FRESH_START: "true"
     ports: ["8000:8000"]
     volumes:
       - state:/app/data
+    depends_on: [redis]
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
 
   worker:
@@ -25,3 +40,4 @@ services:
 
 volumes:
   state: {}
+  redis-data: {}

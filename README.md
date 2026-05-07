@@ -12,7 +12,8 @@ and the system continuously learns from corrections and 👍/👎 signals.
 | OCR / Layout | **Azure Document Intelligence** (`prebuilt-layout`) |
 | LLM | **Azure OpenAI** (`gpt-4o` chat + vision, `text-embedding-ada-002`) |
 | Retrieval | **Azure AI Search** — hybrid (keyword + HNSW vector) |
-| State | **Azure Cosmos DB** (NoSQL) — sessions, feedback, learned rules, golden Q&A |
+| State | **Azure Cosmos DB** (NoSQL) — documents, feedback, learned rules, golden Q&A |
+| Chat Memory | **Redis** (local) / **Azure Cache for Redis** (prod) — session history + chat persistence |
 | Compute | **Azure Kubernetes Service** with Workload Identity |
 | Backend | Python 3.12 + **FastAPI** (SSE streaming) + background **worker** |
 | Frontend | **React + Vite + Tailwind** + MSAL (Azure AD) |
@@ -29,18 +30,19 @@ src/                       service classes — one per Azure SDK
   search_client.py         SearchService    (hybrid search index)
   doc_intelligence.py      DocIntelService  (prebuilt-layout)
   openai_client.py         OpenAIService    (chat / embed / vision)
-  cosmos_client.py         CosmosService    (sessions, feedback, rules, golden, quality)
+  cosmos_client.py         CosmosService    (documents, feedback, rules, golden, quality)
+  redis_memory.py          RedisChatMemory  (session history + chat persistence via Redis)
   ingestion.py             IngestionPipeline (Blob → DocIntel → vision → Search)
   rag.py                   RAGEngine        (retrieve → prompt → stream)
   learning.py              LearningLoop     (feedback → rules + golden + chunk scores)
   auth.py                  AuthService      (Azure AD JWT validation)
-app.py                     FastAPI server (SSE chat, doc CRUD, feedback)
+app.py                     FastAPI server (SSE chat, doc CRUD, feedback, sessions)
 worker.py                  Background ingestion + scheduled learning
 notebooks/                 8 step-by-step component tests
 frontend/                  React + Vite UI
 k8s/                       AKS manifests
 Dockerfile                 backend image
-docker-compose.yaml        local dev (api + worker + ui)
+docker-compose.yaml        local dev (redis + api + worker + ui)
 docs/
   architecture.md          mermaid diagrams
   api.md                   endpoint reference
@@ -71,12 +73,40 @@ npm install
 npm run dev             # http://localhost:3000
 ```
 
-Or start everything in one shot with **docker-compose**:
+Or start everything in one shot with **docker-compose** (includes Redis):
 
 ```powershell
 docker compose up --build
-# UI:  http://localhost:3000
-# API: http://localhost:8000/docs
+# UI:    http://localhost:3000
+# API:   http://localhost:8000/docs
+# Redis: localhost:6379
+```
+
+To clean up all containers/images and rebuild from scratch:
+
+```powershell
+# Stop and remove containers, images, and volumes
+docker compose down --rmi all --volumes
+
+# Rebuild with no cache
+docker compose build --no-cache
+
+# Start again
+docker compose up -d
+```
+
+Or as a one-liner:
+
+```powershell
+docker compose down --rmi all --volumes ; docker compose up -d --build
+```
+
+To run only Redis for local Python development:
+
+```powershell
+docker run -d --name docmind-redis-dev -p 6379:6379 redis:7-alpine
+# Then set REDIS_URL in your .env:
+#   REDIS_URL=redis://localhost:6379/0
 ```
 
 ## Required environment variables
@@ -93,6 +123,8 @@ See `.env` for the full list. The new ones added beyond what was already in your
 | `AZURE_API_CLIENT_ID` | App registration that protects the API |
 | `AZURE_API_AUDIENCE` | Audience claim expected in JWT (defaults to client id) |
 | `DOCMIND_DISABLE_AUTH` | `true` to bypass JWT validation in dev |
+| `REDIS_URL` | Redis connection string (default: `redis://localhost:6379/0`; for Azure Cache for Redis use `rediss://:<key>@<name>.redis.cache.windows.net:6380/0`) |
+| `REDIS_PREFIX` | Key prefix for Redis data (default `docmind`) |
 
 ## Self-improvement loop
 
@@ -150,6 +182,7 @@ flowchart LR
     Worker --> Search
     Worker -.hourly.- Learn[Learning Loop]
     Learn --> Cosmos
+    API -->|chat history| Redis[(Redis)]
 ```
 
 ## Test checklist

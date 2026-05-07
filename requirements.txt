@@ -11,6 +11,9 @@ azure-ai-documentintelligence>=1.0.0b3
 azure-cosmos>=4.7.0
 azure-core>=1.30.0
 
+# --- Chat memory (Redis / Azure Cache for Redis) ---
+redis>=5.0.0
+
 # --- LLM ---
 openai>=1.30.0
 

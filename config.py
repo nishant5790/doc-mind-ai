@@ -78,6 +78,12 @@ COSMOS_CONTAINER_TASKS: str = "ingestion_tasks"
 # Chat model
 GPT_ENGINE: str = os.environ.get("GPT_ENGINE", "gpt-4o")
 
+# Redis (chat memory) — points at local Redis in docker-compose.
+# Swap to Azure Cache for Redis by setting:
+#   REDIS_URL=rediss://:<access-key>@<name>.redis.cache.windows.net:6380/0
+REDIS_URL: str | None = os.environ.get("REDIS_URL") or None
+REDIS_PREFIX: str = os.environ.get("REDIS_PREFIX", "docmind")
+
 # Azure AD (Entra ID) — JWT validation on FastAPI
 AZURE_TENANT_ID: str | None = os.environ.get("AZURE_TENANT_ID") or None
 AZURE_API_CLIENT_ID: str | None = os.environ.get("AZURE_API_CLIENT_ID") or None

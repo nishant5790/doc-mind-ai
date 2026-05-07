@@ -37,6 +37,7 @@ from src.models import (
 )
 from src.openai_client import OpenAIService
 from src.rag import RAGEngine
+from src.redis_memory import create_chat_memory
 from src.search_client import SearchService
 
 import config
@@ -62,7 +63,8 @@ search = SearchService()
 doc_intel = DocIntelService()
 openai_svc = OpenAIService()
 cosmos = create_state_service()
-rag = RAGEngine(search, openai_svc, cosmos)
+chat_memory = create_chat_memory()
+rag = RAGEngine(search, openai_svc, cosmos, memory=chat_memory)
 
 
 @app.on_event("startup")
@@ -76,6 +78,36 @@ def _startup() -> None:
             fn()
         except Exception as exc:  # noqa: BLE001
             log.warning("Startup step %s failed (continuing): %s", name, exc)
+
+    # Optional: wipe every persistent store on boot so each `docker compose up`
+    # gives a clean slate (no stale documents, learning rules, chat history,
+    # ingestion tasks, blobs, or search index). Controlled by FRESH_START env.
+    import os
+
+    fresh = os.environ.get("FRESH_START", "").strip().lower() in ("1", "true", "yes", "on")
+    if fresh:
+        log.warning("FRESH_START=true — wiping all persistent state on startup")
+        try:
+            wiped = cosmos.wipe_all()
+            log.info("FRESH_START: cosmos/local-state wiped: %s", wiped)
+        except Exception:
+            log.exception("FRESH_START: cosmos wipe failed")
+        try:
+            chat_memory.flush_all()
+            log.info("FRESH_START: chat memory flushed")
+        except Exception:
+            log.exception("FRESH_START: chat memory flush failed")
+        try:
+            search.wipe_index()
+            log.info("FRESH_START: search index wiped and recreated")
+        except Exception:
+            log.exception("FRESH_START: search index wipe failed")
+        try:
+            n = user_blob.delete_all(prefix="")
+            log.info("FRESH_START: deleted %d blobs", n)
+        except Exception:
+            log.exception("FRESH_START: blob wipe failed")
+
     log.info("DocMind AI started")
 
 
@@ -157,7 +189,18 @@ async def chat(req: ChatRequest, user_id: str = Depends(current_user)) -> Stream
 
 @app.get("/chat/{session_id}")
 def get_history(session_id: str, user_id: str = Depends(current_user)) -> list[dict]:
-    return [t.model_dump() for t in cosmos.get_history(session_id)]
+    return [t.model_dump() for t in chat_memory.get_history(session_id, limit=200)]
+
+
+@app.get("/sessions")
+def list_sessions(user_id: str = Depends(current_user)) -> list[dict]:
+    """List the caller's chat sessions (most recent first)."""
+    return chat_memory.list_sessions(user_id)
+
+
+@app.delete("/sessions/{session_id}", status_code=204)
+def delete_session(session_id: str, user_id: str = Depends(current_user)) -> None:
+    chat_memory.delete_session(session_id, user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +209,7 @@ def get_history(session_id: str, user_id: str = Depends(current_user)) -> list[d
 @app.post("/feedback", status_code=204)
 def submit_feedback(req: FeedbackRequest, user_id: str = Depends(current_user)) -> None:
     # Look up the original turn to capture question/answer/chunk_ids
-    history = cosmos.get_history(req.session_id, limit=200)
+    history = chat_memory.get_history(req.session_id, limit=200)
     by_id = {t.id: t for t in history}
     target = by_id.get(req.turn_id)
     if not target:
