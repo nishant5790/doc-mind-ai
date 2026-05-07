@@ -143,6 +143,7 @@ class IngestionPipeline:
 
             # 6. Index in AI Search
             self._stage(doc, "index", "running")
+            self.search.create_or_update_index()
             self.search.index_chunks(all_chunks)
             self._stage(doc, "index", "done", detail=f"indexed {len(all_chunks)}")
 
