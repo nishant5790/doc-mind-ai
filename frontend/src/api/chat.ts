@@ -85,3 +85,49 @@ export const Feedback = {
     });
   },
 };
+
+/** Backend chat-turn shape (mirror of `src.models.ChatTurn`). */
+export interface ChatTurnDTO {
+  id: string;
+  session_id: string;
+  user_id: string;
+  role: "user" | "assistant";
+  content: string;
+  sources?: Source[];
+  created_at: string;
+}
+
+export interface SessionMeta {
+  session_id: string;
+  user_id?: string;
+  title?: string;
+  updated_at?: string;
+}
+
+async function authedFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((init.headers as Record<string, string>) || {}),
+  };
+  const auth = await getAuthHeader();
+  if (auth) headers.Authorization = auth;
+  return fetch(path, { ...init, headers });
+}
+
+export const ChatHistory = {
+  /** Fetch a session's full turn list from the server (Redis-backed). */
+  get: async (sessionId: string): Promise<ChatTurnDTO[]> => {
+    const r = await authedFetch(`/api/chat/${encodeURIComponent(sessionId)}`);
+    if (!r.ok) return [];
+    return (await r.json()) as ChatTurnDTO[];
+  },
+  /** List the caller's known chat sessions (most recent first). */
+  list: async (): Promise<SessionMeta[]> => {
+    const r = await authedFetch("/api/sessions");
+    if (!r.ok) return [];
+    return (await r.json()) as SessionMeta[];
+  },
+  remove: async (sessionId: string): Promise<void> => {
+    await authedFetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+  },
+};

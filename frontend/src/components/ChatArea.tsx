@@ -4,13 +4,14 @@ import type { Message, Source } from "../types";
 import { streamChat, Feedback } from "../api/chat";
 
 interface Props {
+  sessionId: string;
+  messages: Message[];
+  setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   selectedDocs: string[];
   onSourcesChange: (sources: Source[]) => void;
 }
 
-export function ChatArea({ selectedDocs, onSourcesChange }: Props) {
-  const [sessionId] = useState(() => crypto.randomUUID());
-  const [messages, setMessages] = useState<Message[]>([]);
+export function ChatArea({ sessionId, messages, setMessages, selectedDocs, onSourcesChange }: Props) {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -26,7 +27,6 @@ export function ChatArea({ selectedDocs, onSourcesChange }: Props) {
     setBusy(true);
 
     let buffer = "";
-    let turnId: string | undefined;
 
     await streamChat(sessionId, text, selectedDocs.length ? selectedDocs : undefined, {
       onSources: (srcs) => {
@@ -46,7 +46,6 @@ export function ChatArea({ selectedDocs, onSourcesChange }: Props) {
         });
       },
       onDone: (id) => {
-        turnId = id;
         setMessages((m) => {
           const out = [...m];
           out[out.length - 1] = { ...out[out.length - 1], id };
