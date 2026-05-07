@@ -37,18 +37,37 @@ RAG Pipeline (Next Query)
 
 ### Layer 1: Chunk Quality Scoring
 
-**What it does:** Tracks which retrieved chunks appear in good vs. bad answers.
+**What it does:** Tracks which retrieved chunks appear in good vs. bad answers, then both **re-ranks** and **filters** future retrievals.
 
 **Mechanism:**
 - For each feedback record, increment `times_in_good_answer` or `times_in_bad_answer` on all cited chunks
 - Recalculate: `quality_score = times_in_good_answer / (times_in_good_answer + times_in_bad_answer)`
-- Default score: `0.5` for unseen chunks
+- Default score: `0.5` for unseen / unjudged chunks
 
-**Impact on RAG:**
-- Retrieved chunks are re-ranked by `(quality_score, original_score)` tuple
-- High-quality chunks float to the top of the context window
+**Impact on RAG (`src/rag.py:retrieve()`):**
 
-**Code Location:** `src/learning.py:_update_chunk_quality()`
+1. **Hard filter (learned-bad)** — chunks with explicit feedback (`good + bad > 0`) and `quality_score < 0.3` are dropped from the candidate set. Because the formula is `good / (good + bad)`, a single 👎 with no 👍 yields `0.0` — enough to immediately retire a clearly irrelevant chunk (e.g. an image wrongly attached to a text-only question).
+2. **Soft re-rank** — surviving chunks are sorted by `quality_score` descending; unjudged chunks stay at the neutral `0.5` default.
+3. **Retrieval counter** — each retrieved chunk's `times_retrieved` is bumped for analytics.
+
+Unjudged chunks are **never** filtered — only ones the system has explicit feedback on. This prevents cold-start starvation while still letting the loop close quickly on bad chunks.
+
+**Tunable constants on `RAGEngine`:**
+- `_BAD_QUALITY_THRESHOLD = 0.3` — drop threshold for judged chunks
+
+**Code Locations:**
+- Score updates: `src/learning.py:_update_chunk_quality()`
+- Retrieval-time filter + rerank: `src/rag.py:retrieve()`
+
+#### Worked example
+
+A user asks *"who is the developer?"*. The hybrid search returns 5 text chunks plus, before the fix, a wrongly-matched mind-map image (chunk `img-15`). The user clicks 👎.
+
+- `update_chunk_quality("img-15", bad=True)` → `quality_score = 0/1 = 0.0`
+- Next query that surfaces `img-15` → filter sees `judged > 0` and `score < 0.3` → drops it
+- Same query also benefits from the **visual-intent gate** in `src/rag.py` (see `docs/api.md` §5), which would no longer have requested the image pass for that question in the first place
+
+The two protections are independent and complementary: the gate stops bad images from being **proposed**, and the learned-bad filter stops any judged-bad chunk from being **shown again** even if it does get proposed.
 
 ---
 

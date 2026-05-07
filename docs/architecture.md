@@ -21,6 +21,7 @@ flowchart TB
         OpenAI[Azure OpenAI<br/>gpt-4o + ada-002]
         Search[(AI Search<br/>hybrid index)]
         Cosmos[(Cosmos DB<br/>NoSQL)]
+        Redis[(Redis<br/>chat memory)]
         AAD[Azure AD / Entra ID]
     end
 
@@ -30,6 +31,7 @@ flowchart TB
 
     API -->|JWKS| AAD
     API --> Cosmos
+    API --> Redis
     API --> Search
     API --> OpenAI
     API -->|enqueue task| Cosmos
@@ -42,7 +44,7 @@ flowchart TB
     Worker -.hourly.-> Cosmos
 
     classDef azure fill:#e8f1fb,stroke:#0078d4,color:#0b3d6b;
-    class Blob,DocIntel,OpenAI,Search,Cosmos,AAD azure;
+    class Blob,DocIntel,OpenAI,Search,Cosmos,Redis,AAD azure;
 ```
 
 ## 2. Ingestion flow (PDF with embedded images)
@@ -95,6 +97,7 @@ sequenceDiagram
     participant API as FastAPI
     participant E as ada-002
     participant S as AI Search
+    participant Redis as Redis
     participant Cosmos
     participant L as gpt-4o
 
@@ -103,7 +106,7 @@ sequenceDiagram
     API->>E: embed(question)
     API->>S: hybrid search (keyword + vector)
     S-->>API: top-K chunks
-    API->>Cosmos: get_history(session_id)
+    API->>Redis: get_history(session_id)
     API->>Cosmos: get_rules(category)
     API->>Cosmos: get_golden_pairs(topic)
     API->>Cosmos: get_chunk_quality(...)  # re-rank
@@ -113,7 +116,7 @@ sequenceDiagram
         L-->>API: delta token
         API-->>UI: data: {token}
     end
-    API->>Cosmos: save user + assistant turns
+    API->>Redis: save user + assistant turns
     API-->>UI: data: {done}
 ```
 
@@ -491,15 +494,15 @@ graph TB
     B4 --> D4["Scale up/down freely<br/>without coordination"]
     
     subgraph Implementation["🔧 How We Achieve It"]
-        I1["All state in Cosmos DB"]
-        I2["No local cache persistence"]
+        I1["All learning state in Cosmos DB"]
+        I2["Chat memory in Redis"]
         I3["Session ID in request"]
         I4["JWT auth per request"]
     end
     
     D1 --> I1
     D2 --> I3
-    D3 --> I1
+    D3 --> I2
     D4 --> I2
     
     classDef benefits fill:#d4edda,stroke:#155724
@@ -621,13 +624,21 @@ graph TB
 
 | Container | Partition key | Stores |
 |---|---|---|
-| `sessions` | `/session_id` | Chat turns (user + assistant + sources) |
 | `documents` | `/user_id` | Doc metadata, ingestion status |
 | `feedback` | `/session_id` | 👍/👎 + corrections |
 | `learned_rules` | `/category` | Distilled imperative guidelines |
 | `golden_pairs` | `/topic` | Confirmed-correct Q&A pairs (few-shot) |
 | `chunk_quality` | `/chunk_id` | Per-chunk retrieval quality (0..1) |
 | `ingestion_tasks` | `/status` | Worker queue (queued / running / done / failed) |
+
+### Redis keys (chat memory)
+
+| Key pattern | Type | Stores |
+|---|---|---|
+| `docmind:turn:{session_id}` | LIST | Ordered chat turns (user + assistant) |
+| `docmind:session:{user_id}` | HASH | Per-user session index with title and updated_at |
+
+Chat turns were moved from Cosmos `sessions` to Redis for lower-latency reads and to keep sessions persistent across UI tab switches, page reloads, and API restarts. For production, replace `REDIS_URL` with an Azure Cache for Redis connection string (`rediss://...`).
 
 ## 10. AI Search index schema
 

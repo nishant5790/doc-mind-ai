@@ -6,7 +6,7 @@ This document describes the runtime architecture, execution flows, storage model
 
 ## 1. What the project does
 
-The system combines six responsibilities:
+The system combines seven responsibilities:
 
 1. Document intake through a FastAPI backend and React frontend.
 2. Asynchronous ingestion of PDFs and images by a background worker.
@@ -14,6 +14,7 @@ The system combines six responsibilities:
 4. Multimodal enrichment with Azure OpenAI for embeddings and image understanding.
 5. Hybrid retrieval through Azure AI Search.
 6. Continuous improvement through feedback stored in Cosmos DB.
+7. Persistent chat memory via Redis (or Azure Cache for Redis) so sessions survive UI tab switches, page reloads, and API restarts.
 
 In practice, that means a user can upload a document, wait for indexing, ask questions in natural language, inspect cited sources, and then submit thumbs-up or thumbs-down feedback with optional corrections. The worker uses that feedback to improve future retrieval and prompting.
 
@@ -37,12 +38,14 @@ flowchart TB
         AOAI[Azure OpenAI\nchat + vision + embeddings]
         Search[Azure AI Search\nhybrid index]
         Cosmos[Cosmos DB\nstate + learning data]
+        Redis[Redis\nchat memory + session index]
     end
 
     UI -->|Bearer token| API
     UI -->|MSAL sign-in| AAD
     API -->|JWT validation via JWKS| AAD
-    API -->|save docs, sessions, feedback| Cosmos
+    API -->|save docs, feedback| Cosmos
+    API -->|chat history| Redis
     API -->|query index| Search
     API -->|chat + embeddings| AOAI
     API -->|upload source files| Blob
@@ -73,11 +76,11 @@ The API entry point is `app.py`. It owns synchronous request/response concerns:
 - document upload and metadata creation
 - document listing and deletion
 - streaming chat responses
-- session history lookup
+- session history lookup and session listing
 - feedback submission
 - manual admin operations for learning and cleanup
 
-The API creates singleton service objects for Blob Storage, AI Search, Document Intelligence, Azure OpenAI, Cosmos DB, and the RAG engine. On startup it best-effort initializes containers and search infrastructure.
+The API creates singleton service objects for Blob Storage, AI Search, Document Intelligence, Azure OpenAI, Cosmos DB, Redis chat memory, and the RAG engine. On startup it best-effort initializes containers and search infrastructure.
 
 ### Background worker
 
@@ -96,9 +99,10 @@ The `src/` package is organized around one service abstraction per platform conc
 - `doc_intelligence.py`: wrapper around Azure Document Intelligence layout extraction.
 - `openai_client.py`: chat completions, streaming tokens, embeddings, and image description.
 - `search_client.py`: index creation, upload, search, and document-level deletion in Azure AI Search.
-- `cosmos_client.py`: state persistence for documents, sessions, feedback, learned rules, golden pairs, chunk quality, and queued tasks.
+- `cosmos_client.py`: state persistence for documents, feedback, learned rules, golden pairs, chunk quality, and queued tasks.
+- `redis_memory.py`: Redis-backed chat memory for session turns and session index. Falls back to an in-process store if Redis is not available.
 - `ingestion.py`: orchestration pipeline for document processing.
-- `rag.py`: retrieval, reranking, prompt construction, streaming answer generation, and turn persistence.
+- `rag.py`: retrieval, reranking, prompt construction, streaming answer generation, and turn persistence (via the pluggable memory backend).
 - `learning.py`: feedback-driven improvement loop.
 - `auth.py`: Azure AD token validation and user resolution.
 - `models.py`: Pydantic request, response, and persistence models.
@@ -164,14 +168,20 @@ This matters because the RAG layer explicitly tries to preserve image evidence f
 
 ## 5. Query and answer flow
 
-The chat path is implemented in `src/rag.py`. A user message is embedded, matched against Azure AI Search, optionally augmented with image chunks, reranked using learned chunk quality, and then passed to Azure OpenAI together with prior history, learned rules, and golden examples.
+The chat path is implemented in `src/rag.py`. A user message is embedded, matched against Azure AI Search, conditionally augmented with image chunks based on a hybrid visual-intent score, filtered against learned-bad chunks, reranked using learned chunk quality, and then passed to Azure OpenAI together with prior history, learned rules, and golden examples.
 
 ```mermaid
 flowchart LR
     Q[User question] --> EMBED[Create embedding]
     EMBED --> RETRIEVE[Hybrid search in AI Search]
-    RETRIEVE --> VISUAL[Optional image-chunk pass]
-    VISUAL --> RERANK[Re-rank with chunk quality from Cosmos]
+    Q --> INTENT[Visual-intent score:<br/>keyword + LLM judge]
+    INTENT -->|score >= 0.6| VISUAL[Image-only search pass]
+    INTENT -->|score < 0.6| SKIP[Skip image pass]
+    RETRIEVE --> MERGE[Merge candidates]
+    VISUAL --> MERGE
+    SKIP --> MERGE
+    MERGE --> FILTER[Drop learned-bad chunks<br/>quality_score < 0.3]
+    FILTER --> RERANK[Re-rank with chunk quality from Cosmos]
     RERANK --> CONTEXT[Assemble sources]
     CONTEXT --> HISTORY[Load recent session turns]
     CONTEXT --> RULES[Load learned rules]
@@ -184,10 +194,36 @@ flowchart LR
     SAVE --> SSE[Send SSE events to UI]
 ```
 
+### Visual-intent scoring
+
+Image chunks carry only short captions and are easily out-ranked by text chunks in hybrid search. To decide whether to run an extra image-only retrieval pass, the engine combines two cheap signals into a 0..1 score:
+
+| Signal | Score contribution | Notes |
+|---|---|---|
+| Strong keyword (`diagram`, `figure`, `chart`, `image`, `screenshot`, `flowchart`, `architecture`, ...) | `1.0` | Short-circuits — LLM call skipped |
+| Weak keyword (`how`, `workflow`, `process`, `flow`, `pipeline`, `steps`, ...) | `0.5` | Needs LLM agreement to clear threshold |
+| LLM-as-judge (`gpt-4o`, single-token classifier) | up to `0.7` | `score * _LLM_WEIGHT`; capped, additive |
+
+The combined score is `min(1.0, keyword_score + llm_score * 0.7)`. The image pass runs when the score is at or above `_VISUAL_INTENT_THRESHOLD` (default `0.6`). All thresholds and word lists are tunable as class constants on `RAGEngine` in `src/rag.py`.
+
+Design properties:
+
+- A strong keyword alone always triggers and skips the LLM call (cheapest, most confident).
+- A weak keyword (0.5) plus an agreeing LLM judgement (`>= ~0.15` raw) clears the threshold.
+- An LLM judgement alone needs a confidence of `>= ~0.86` raw to clear it (deliberately conservative).
+- The classifier returns `0.0` on any error so retrieval never blocks on it.
+- Every retrieval logs `Visual-intent score=X.XX -> wants_visual=Y` at INFO level for tuning.
+
+### Learned-bad filter
+
+After all candidate chunks are gathered (text + optional images), any chunk whose `chunk_quality` record shows explicit feedback (`good + bad > 0`) and a `quality_score < _BAD_QUALITY_THRESHOLD` (default `0.3`) is removed from the result set. Because `quality_score = good / (good + bad)`, a single thumbs-down with no thumbs-up is enough to retire a clearly irrelevant chunk. Unjudged chunks are never filtered — they default to the neutral `0.5` and still get a chance to prove themselves.
+
 ### Why the answer path is structured this way
 
 - The hybrid search pass mixes lexical and vector similarity.
-- The image-only pass avoids a common failure mode where image chunks lose ranking to text chunks.
+- The visual-intent gate prevents irrelevant figures from being attached to text-only questions (e.g. a mind-map appearing under "who is the developer?").
+- The image-only pass — when actually warranted — surfaces diagrams that hybrid scoring would otherwise drop.
+- The learned-bad filter closes the feedback loop: one 👎 is enough to retire a chunk; future queries no longer see it.
 - The chunk-quality rerank adds a lightweight learned signal without rebuilding the index.
 - The rules and golden pairs change the prompt rather than hard-coding brittle answer logic.
 - SSE keeps the UI responsive during longer generations.
@@ -239,13 +275,26 @@ Cosmos DB is the operational backbone for non-search state. The main containers 
 
 | Container | Partition key | Purpose |
 |---|---|---|
-| `sessions` | `/session_id` | user and assistant turns |
 | `documents` | `/user_id` | uploaded document metadata and status |
 | `feedback` | `/session_id` | thumbs-up, thumbs-down, and corrections |
 | `learned_rules` | `/category` | prompt guidance distilled from corrections |
 | `golden_pairs` | `/topic` | promoted high-quality examples |
 | `chunk_quality` | `/chunk_id` | retrieval quality counters and score |
 | `ingestion_tasks` | `/status` | worker queue |
+
+### Redis
+
+Chat memory is stored in Redis, separate from Cosmos DB. This keeps hot-path session reads fast and allows easy swapping between local Redis and Azure Cache for Redis.
+
+| Key pattern | Type | Purpose |
+|---|---|---|
+| `docmind:turn:{session_id}` | LIST | Ordered chat turns (user + assistant) |
+| `docmind:session:{user_id}` | HASH | Per-user session index (title, updated_at) |
+
+Relevant configuration:
+
+- `REDIS_URL`: connection string (e.g. `redis://localhost:6379/0` or `rediss://:<key>@<name>.redis.cache.windows.net:6380/0`)
+- `REDIS_PREFIX`: key namespace prefix (default `docmind`)
 
 Blob Storage holds raw uploaded files and extracted image assets. Azure AI Search holds retrievable chunk records only. This split keeps large binaries out of Cosmos and keeps search-oriented documents out of the transactional state store.
 
@@ -265,6 +314,8 @@ Relevant configuration values:
 - `AZURE_API_CLIENT_ID`
 - `AZURE_API_AUDIENCE`
 - `DOCMIND_DISABLE_AUTH`
+- `REDIS_URL`
+- `REDIS_PREFIX`
 
 For local development, authentication can be disabled explicitly. For production, the expected model is Azure AD protected API access.
 
@@ -411,7 +462,29 @@ data: {"type":"error","message":"..."}
 
 ### `GET /chat/{session_id}`
 
-Return session history as an array of `ChatTurn`, oldest first.
+Return session history as an array of `ChatTurn`, oldest first. History is read from Redis.
+
+### `GET /sessions`
+
+List the caller's known chat sessions, most recent first.
+
+**Response 200**
+```json
+[
+  {
+    "session_id": "uuid",
+    "title": "What is the project architecture",
+    "user_id": "anonymous",
+    "updated_at": "2026-05-07T10:55:31+00:00"
+  }
+]
+```
+
+### `DELETE /sessions/{session_id}`
+
+Delete a chat session and all its turns from Redis.
+
+- `204`: success with no body
 
 ### `POST /feedback`
 
