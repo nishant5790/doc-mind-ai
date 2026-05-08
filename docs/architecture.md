@@ -49,6 +49,9 @@ flowchart TB
 
 ## 2. Ingestion flow (PDF with embedded images)
 
+Detailed stage-by-stage breakdown lives in [ingestion-pipeline.md](ingestion-pipeline.md).
+High-level sequence:
+
 ```mermaid
 sequenceDiagram
     actor U as User
@@ -57,7 +60,8 @@ sequenceDiagram
     participant Cosmos
     participant Blob
     participant W as Worker
-    participant DI as Doc Intel
+    participant DI as Doc Intel<br/>(prebuilt-layout)
+    participant PM as PyMuPDF
     participant V as GPT-4o vision
     participant E as ada-002
     participant S as AI Search
@@ -74,21 +78,33 @@ sequenceDiagram
     end
     W->>Blob: download PDF
     W->>DI: prebuilt-layout(blob_url)
-    DI-->>W: text + tables
-    W->>W: PyMuPDF — extract embedded images
-    loop each image
-        W->>Blob: upload extracted image
-        W->>V: describe_image(url)
-        V-->>W: description text
+    DI-->>W: text + tables + figures (with captions)
+
+    Note over W,PM: Hybrid image extraction
+    loop each DI figure
+        W->>PM: crop bbox at 200 DPI
+        PM-->>W: PNG bytes
+        W->>Blob: upload figure
+        W->>V: describe_image(url, caption hint)
+        V-->>W: caption-grounded description
     end
+    loop each PyMuPDF raster (IoU < 0.4 vs figures)
+        W->>Blob: upload raster
+        W->>V: describe_image(url)
+        V-->>W: description
+    end
+
     W->>W: smart-chunk text + tables + image descriptions
     W->>E: embed all chunks (batched)
     E-->>W: vectors
-    W->>S: upload chunks (with vectors)
+    W->>S: upload chunks (vectors + caption + source)
     W->>Cosmos: update DocumentMeta(status=indexed)
 ```
 
 ## 3. Query flow (RAG with self-improvement)
+
+Detailed walk-through of retrieval, visual-intent routing and the self-learning
+feedback loop lives in [rag-pipeline.md](rag-pipeline.md). High-level sequence:
 
 ```mermaid
 sequenceDiagram
@@ -648,8 +664,10 @@ Chat turns were moved from Cosmos `sessions` to Redis for lower-latency reads an
 | `doc_id` | string (filterable) | parent document |
 | `page` | int32 (filterable) | page number |
 | `type` | string (filterable) | `text` / `table` / `image` |
-| `content` | searchable string | text or image description |
-| `image_url` | string | Blob URL for image chunks |
+| `source` | string (filterable, facetable) | image provenance: `figure` (DI) / `raster` (PyMuPDF); null for text/table |
+| `content` | searchable string (en.lucene) | text or image description (caption prepended for images) |
+| `caption` | searchable string (en.lucene) | DI figure caption verbatim (image chunks only) |
+| `image_url` | string (retrievable) | Blob URL for image chunks |
 | `embedding` | Collection(Single) | 1536-d vector, HNSW |
 
 ## 11. Production Deployment Checklist

@@ -2,36 +2,139 @@
 
 ## Overview
 
-The self-learning system is a three-layer feedback loop that continuously improves the RAG (Retrieval-Augmented Generation) pipeline based on user interactions. Users provide explicit feedback (👍/👎) with optional corrections, which are processed hourly to refine chunk quality scores, distill learned rules, and build a golden Q&A corpus.
+The self-learning system is a three-layer feedback loop that continuously improves the RAG (Retrieval-Augmented Generation) pipeline based on user interactions. Users provide explicit feedback (👍 / 👎 / ✏️ correction) from the **Chat (RAG)** view, and the **Self-Improvement** view exposes a one-click _Run Learning Loop_ button (also scheduled hourly by the worker) that processes feedback into three artifact families: **chunk quality scores**, **learned rules**, and **golden Q&A pairs**.
+
+The Self-Improvement view in the UI surfaces:
+
+- A summary banner — `processed N feedback events · added X rules · promoted Y golden pairs · updated Z chunk scores`
+- Counters for 👍 up-votes, 👎 down-votes, ✏️ corrections, and total feedback
+- The current list of **Learned Rules** (with `evidence × N` badges)
+- A **Reset Learning** button that wipes all four learning containers
 
 ## Architecture
 
 ### Components
 
-1. **Feedback Collection** — User feedback (thumbs up/down + optional correction text)
-2. **Learning Loop** — Hourly batch processor that runs three improvement layers
-3. **Cosmos DB Storage** — Persists feedback, learned rules, golden pairs, and chunk quality metrics
-4. **RAG Query Pipeline** — Injects learned artifacts into prompts at query time
+| # | Component | File / Container | Role |
+|---|-----------|------------------|------|
+| 1 | Feedback collector | `frontend/src/components/ChatArea.tsx` → `POST /chat/feedback` | Captures 👍 / 👎 / correction with `chunk_ids` cited in the answer |
+| 2 | Feedback store | Cosmos `feedback` | Append-only log of `FeedbackRecord` |
+| 3 | Learning loop | `src/learning.py` `LearningLoop.run_once()` | Three-layer batch processor |
+| 4 | Worker scheduler | `worker.py` (every `LEARN_INTERVAL_SECONDS`) | Periodic trigger |
+| 5 | Manual trigger | `POST /admin/learn` from `LearningView.tsx` | On-demand run from the UI |
+| 6 | Artifact stores | Cosmos `learned_rules`, `golden_pairs`, `chunk_quality` | Persisted learning state |
+| 7 | RAG injector | `src/rag.py` `RAGEngine.answer()` | Filters/reranks chunks, injects rules + golden pairs into the prompt |
 
-### Data Flow
+### High-level data flow
 
+```mermaid
+flowchart LR
+    U["User<br/>(Chat RAG view)"] -- "👍 / 👎 / ✏️ correction" --> API["FastAPI<br/>POST /chat/feedback"]
+    API --> FB[("Cosmos<br/>feedback")]
+
+    subgraph LOOP["LearningLoop.run_once()"]
+        direction TB
+        L1["Layer 1<br/>_update_chunk_quality()"]
+        L2["Layer 2<br/>_distil_rules()<br/>(GPT-4o)"]
+        L3["Layer 3<br/>_promote_golden()"]
+    end
+
+    Worker["worker.py<br/>hourly"] --> LOOP
+    UI["Self-Improvement view<br/>'Run Learning Loop' button"] --> AdminAPI["POST /admin/learn"] --> LOOP
+    FB --> LOOP
+
+    L1 --> CQ[("Cosmos<br/>chunk_quality")]
+    L2 --> LR[("Cosmos<br/>learned_rules")]
+    L3 --> GP[("Cosmos<br/>golden_pairs")]
+
+    subgraph RAG["RAGEngine.answer() — next query"]
+        direction TB
+        Retrieve["retrieve()<br/>filter + rerank by quality_score"]
+        Prompt["build prompt<br/>+ rules<br/>+ golden few-shots"]
+        LLM["gpt-4o stream"]
+    end
+
+    CQ --> Retrieve
+    LR --> Prompt
+    GP --> Prompt
+    Retrieve --> Prompt --> LLM --> U
 ```
-User Feedback (👍/👎 + correction)
-    ↓
-Cosmos DB Feedback Container
-    ↓
-Worker Process (Hourly LearningLoop.run_once())
-    ├── Layer 1: Chunk Quality Updates
-    ├── Layer 2: Rule Distillation
-    └── Layer 3: Golden Pair Promotion
-    ↓
-Learned Artifacts (Quality Scores, Rules, Pairs)
-    ↓
-RAG Pipeline (Next Query)
-    ├── Rerank chunks by quality_score
-    ├── Inject rules into system prompt
-    └── Add golden pairs as few-shot examples
+
+### End-to-end sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant FE as Frontend (ChatArea / LearningView)
+    participant API as FastAPI (app.py)
+    participant Cosmos as Cosmos DB
+    participant Worker as worker.py
+    participant LL as LearningLoop
+    participant LLM as Azure OpenAI (gpt-4o)
+    participant RAG as RAGEngine
+
+    User->>FE: Asks question
+    FE->>API: POST /chat
+    API->>RAG: answer(question)
+    RAG->>Cosmos: get_rules(), get_golden_pairs(), get_chunk_quality()
+    RAG->>LLM: stream completion
+    RAG-->>FE: streamed answer + sources (chunk_ids)
+    User->>FE: Clicks 👎 + writes correction
+    FE->>API: POST /chat/feedback {rating, correction, chunk_ids}
+    API->>Cosmos: save_feedback(FeedbackRecord)
+
+    Note over Worker,LL: Every LEARN_INTERVAL_SECONDS<br/>OR user clicks "Run Learning Loop"
+    Worker->>LL: run_once()
+    LL->>Cosmos: list_feedback(limit=200)
+    LL->>Cosmos: update_chunk_quality(...)
+    LL->>LLM: distil rules from corrections
+    LLM-->>LL: JSON {rules:[...]}
+    LL->>Cosmos: upsert LearnedRule (deterministic id)
+    LL->>Cosmos: upsert GoldenPair
+    LL-->>API: stats {feedback_count, rules_added, ...}
+    API-->>FE: GET /admin/learning-stats
 ```
+
+## UI: the Self-Improvement view
+
+The **Self-Improvement** tab (rendered by `frontend/src/components/LearningView.tsx`) is the operator dashboard for the loop:
+
+```mermaid
+flowchart TB
+    subgraph UI["Self-Improvement view"]
+        direction TB
+        Btn1["▶ Run Learning Loop"] --> POST["POST /admin/learn"]
+        Btn2["🗑 Reset Learning"] --> DEL["POST /admin/reset-learning"]
+        Banner["Last run: processed N · added X rules ·<br/>promoted Y golden pairs · updated Z chunks"]
+        Counters["👍 up · 👎 down · ✏ corrections · total"]
+        RulesList["Learned Rules<br/>(category · rule · evidence × N)"]
+    end
+
+    POST --> Loop["LearningLoop.run_once()"]
+    Loop --> Stats["LearningStats"] --> Banner
+    DEL --> Wipe["wipe_learning()"] --> Reset["counters → 0"]
+
+    GET1["GET /admin/learning-stats"] --> Counters
+    GET2["GET /admin/rules"] --> RulesList
+```
+
+Pressing **Run Learning Loop** is equivalent to waiting for the worker's hourly tick — it calls `LearningLoop.run_once()` synchronously and then the view refetches stats and rules. **Reset Learning** truncates `feedback`, `learned_rules`, `golden_pairs`, and `chunk_quality`.
+
+### Lifecycle of a single LearnedRule
+
+```mermaid
+stateDiagram-v2
+    [*] --> Distilled : gpt-4o emits rule from corrections
+    Distilled --> Stored : upsert with deterministic id<br/>(rule-sha1(category:normalized))
+    Stored --> Refreshed : next run on overlapping corpus<br/>(same id → updated_at refresh)
+    Stored --> Injected : RAGEngine.get_rules(top=5)<br/>→ system prompt
+    Stored --> Wiped : Reset Learning button
+    Refreshed --> Injected
+    Wiped --> [*]
+```
+
+---
 
 ## Three Learning Layers
 
@@ -43,6 +146,25 @@ RAG Pipeline (Next Query)
 - For each feedback record, increment `times_in_good_answer` or `times_in_bad_answer` on all cited chunks
 - Recalculate: `quality_score = times_in_good_answer / (times_in_good_answer + times_in_bad_answer)`
 - Default score: `0.5` for unseen / unjudged chunks
+
+```mermaid
+flowchart TD
+    FB["FeedbackRecord<br/>rating + chunk_ids[]"] --> Loop{"For each<br/>chunk_id"}
+    Loop -->|rating=up| GOOD["times_in_good_answer += 1"]
+    Loop -->|rating=down| BAD["times_in_bad_answer += 1"]
+    GOOD --> RECAL["quality_score =<br/>good / (good + bad)"]
+    BAD --> RECAL
+    RECAL --> CQ[("Cosmos<br/>chunk_quality")]
+
+    subgraph RET["Next retrieve()"]
+        direction TB
+        Hyb["Hybrid search<br/>top-K candidates"] --> JOIN["Join with chunk_quality"]
+        JOIN --> Filter{"judged AND<br/>score < 0.3?"}
+        Filter -->|yes| Drop["✗ drop"]
+        Filter -->|no| Keep["sort by quality desc<br/>(unjudged = 0.5)"]
+    end
+    CQ --> JOIN
+```
 
 **Impact on RAG (`src/rag.py:retrieve()`):**
 
@@ -84,11 +206,41 @@ The two protections are independent and complementary: the gate stops bad images
    Correction: {correction}
    ```
 3. Call GPT-4o (temperature=0.0) with `DISTIL_PROMPT` to extract 3–7 rules in strict JSON
-4. Save each `LearnedRule` with metadata:
-   - `category`: e.g., "general"
-   - `rule`: imperative string (e.g., "Always cite sources for claims")
-   - `evidence_count`: number of corrections used
-   - `updated_at`: ISO timestamp
+4. **De-duplicate** each rule by computing a deterministic id from a normalized form of the rule text:
+   - `_normalize_rule()` — lowercase, collapse whitespace, strip punctuation
+   - `_rule_id()` — `"rule-" + sha1(category + ":" + normalized_rule)[:24]`
+5. Upsert each `LearnedRule` with that stable id, so re-runs **refresh** existing rules instead of inserting duplicates
+
+```mermaid
+flowchart TD
+    FB[("Cosmos feedback<br/>rating=down + correction")] --> Filter["take last 30 corrections"]
+    Filter --> Prompt["DISTIL_PROMPT +<br/>Q / Bad answer / Correction"]
+    Prompt --> GPT["gpt-4o<br/>temp=0.0<br/>strict JSON"]
+    GPT --> Parse["json.loads(rules[])"]
+    Parse --> Norm["_normalize_rule(text)"]
+    Norm --> ID["_rule_id(category, norm)<br/>= rule-sha1(...)"]
+    ID --> Seen{"id seen<br/>in this batch?"}
+    Seen -->|yes| Skip["skip duplicate"]
+    Seen -->|no| Upsert["cosmos.save_rule(<br/>LearnedRule(id=...))"]
+    Upsert --> LR[("Cosmos<br/>learned_rules")]
+
+    subgraph QT["Query time"]
+        Get["get_rules(top=5)"] --> Inject["Append to system prompt:<br/>'Learned guidelines:'"]
+    end
+    LR --> Get
+```
+
+> **Idempotency note.** Earlier versions assigned a fresh UUID to every distilled rule, which caused duplicate entries in the `learned_rules` container after every loop run (visible as the repeated rows in the Self-Improvement view). The deterministic-id scheme above means re-running the loop on the same feedback corpus is now a **no-op upsert** — the row is touched but its id stays the same, so the UI list does not grow.
+
+**Schema highlights — `LearnedRule`:**
+
+| Field | Example | Notes |
+|-------|---------|-------|
+| `id` | `rule-9f1c43...` | sha1 of `category + normalized rule` |
+| `category` | `general` | Cosmos partition key |
+| `rule` | `Always cite sources for numerical claims.` | Original LLM-distilled text |
+| `evidence_count` | `7` | Number of corrections in the batch that produced it |
+| `updated_at` | `2026-05-08T10:14:22Z` | Refreshed on every re-distillation |
 
 **Impact on RAG:**
 - Top 5 rules pulled at query time
@@ -106,10 +258,25 @@ The two protections are independent and complementary: the gate stops bad images
 **Mechanism:**
 1. For each feedback with `rating="up"` (👍), `question`, and `answer`, upsert as `GoldenPair`
 2. Store with:
-   - `topic`: e.g., "general"
+   - `topic`: e.g., "general" (partition key)
    - `question`: user's query
    - `answer`: assistant's response
    - `chunk_ids`: supporting chunks
+
+```mermaid
+flowchart LR
+    FB[("Cosmos feedback")] --> F{"rating == 'up'<br/>AND question<br/>AND answer?"}
+    F -->|no| Skip["skip"]
+    F -->|yes| GP["GoldenPair(<br/>topic, question,<br/>answer, chunk_ids)"]
+    GP --> Save["cosmos.save_golden()"]
+    Save --> Store[("Cosmos<br/>golden_pairs")]
+
+    subgraph QT["Query time"]
+        direction TB
+        Pull["get_golden_pairs(top=2)"] --> FewShot["Inject as few-shot<br/>Q→A examples in prompt"]
+    end
+    Store --> Pull
+```
 
 **Impact on RAG:**
 - Top 2 pairs fetched at query time
@@ -340,3 +507,4 @@ cosmos.wipe_learning()  # Clears: feedback, learned_rules, golden_pairs, chunk_q
 | Quality scores stay at 0.5 | Chunks not cited in feedback | Check that chunk_ids are correctly tracked in feedback |
 | Golden pairs not improving answers | Low-quality examples being saved | Add quality gate: only save if feedback has high confidence |
 | Learning loop crashes | JSON parsing error in GPT response | Add retry logic and fallback to empty rules |
+| Duplicate rules in the UI after re-running the loop | Pre-fix builds assigned a fresh UUID per rule on every run | Resolved — rules now use a deterministic id `rule-sha1(category:normalized_rule)` so re-runs upsert in place. Click **Reset Learning** once to clear historical duplicates. |
