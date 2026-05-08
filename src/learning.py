@@ -23,8 +23,10 @@ the worker calls on a schedule.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from src.cosmos_client import CosmosService
@@ -104,16 +106,31 @@ class LearningLoop:
             log.warning("Rule distillation failed: %s", e)
             return 0
 
+        added = 0
+        seen_ids: set[str] = set()
         for r in rules:
+            text = r.strip()
+            if not text:
+                continue
+            norm = self._normalize_rule(text)
+            if not norm:
+                continue
+            category = "general"
+            rule_id = self._rule_id(category, norm)
+            if rule_id in seen_ids:
+                continue
+            seen_ids.add(rule_id)
             self.cosmos.save_rule(
                 LearnedRule(
-                    category="general",
-                    rule=r.strip(),
+                    id=rule_id,
+                    category=category,
+                    rule=text,
                     evidence_count=len(corrections),
                     updated_at=datetime.now(timezone.utc).isoformat(),
                 )
             )
-        return len(rules)
+            added += 1
+        return added
 
     # ------------------------------------------------------------------
     def _promote_golden(self, feedback: list[FeedbackRecord]) -> int:
@@ -130,6 +147,25 @@ class LearningLoop:
                 )
                 n += 1
         return n
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_rule(text: str) -> str:
+        """Normalize a rule for de-duplication.
+
+        Lowercase, strip, collapse whitespace, drop trailing punctuation, and
+        remove non-alphanumeric noise so near-identical wordings collapse to
+        the same key.
+        """
+        t = text.lower().strip()
+        t = re.sub(r"\s+", " ", t)
+        t = re.sub(r"[^a-z0-9 ]+", "", t)
+        return t.strip()
+
+    @staticmethod
+    def _rule_id(category: str, normalized_rule: str) -> str:
+        h = hashlib.sha1(f"{category}:{normalized_rule}".encode("utf-8")).hexdigest()
+        return f"rule-{h[:24]}"
 
     # ------------------------------------------------------------------
     @staticmethod

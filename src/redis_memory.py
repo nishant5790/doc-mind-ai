@@ -81,10 +81,30 @@ class RedisChatMemory:
         if url:
             try:
                 import redis  # type: ignore
+                from redis.retry import Retry  # type: ignore
+                from redis.backoff import ExponentialBackoff  # type: ignore
 
-                self._client = redis.Redis.from_url(url, decode_responses=True)
+                # Production-grade settings:
+                #   - socket_timeout / socket_connect_timeout: avoid hangs.
+                #   - health_check_interval: Azure Cache for Redis closes idle
+                #     connections after ~10 min; periodic PINGs keep the pool warm.
+                #   - retry on TimeoutError/ConnectionError with exponential backoff.
+                #   - rediss:// URLs automatically enable TLS.
+                self._client = redis.Redis.from_url(
+                    url,
+                    decode_responses=True,
+                    socket_timeout=5,
+                    socket_connect_timeout=5,
+                    socket_keepalive=True,
+                    health_check_interval=30,
+                    retry=Retry(ExponentialBackoff(cap=10, base=1), retries=3),
+                    retry_on_timeout=True,
+                    retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+                )
                 self._client.ping()
-                log.info("RedisChatMemory connected: %s", url)
+                # Don't log the URL — it may contain an access key.
+                scheme = url.split("://", 1)[0]
+                log.info("RedisChatMemory connected (%s, TLS=%s)", scheme, scheme == "rediss")
             except Exception as exc:  # noqa: BLE001
                 log.warning("Redis unavailable (%s) — using in-process fallback", exc)
                 self._client = None

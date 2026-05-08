@@ -14,7 +14,9 @@ fields:
     doc_id      (filterable string)
     page        (filterable int32)
     type        (filterable string)
+    source      (filterable string)   — "figure" | "raster" for image chunks
     content     (searchable text, en.lucene)
+    caption     (searchable text, en.lucene)
     image_url   (string, retrievable)
     embedding   (Collection(Edm.Single), HNSW vector field)
 """
@@ -72,7 +74,9 @@ class SearchService:
             SimpleField(name="doc_id", type=SearchFieldDataType.String, filterable=True),
             SimpleField(name="page", type=SearchFieldDataType.Int32, filterable=True),
             SimpleField(name="type", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="source", type=SearchFieldDataType.String, filterable=True, facetable=True),
             SearchableField(name="content", type=SearchFieldDataType.String, analyzer_name="en.lucene"),
+            SearchableField(name="caption", type=SearchFieldDataType.String, analyzer_name="en.lucene"),
             SimpleField(name="image_url", type=SearchFieldDataType.String),
             SearchField(
                 name="embedding",
@@ -113,6 +117,7 @@ class SearchService:
         top_k: int = 5,
         doc_ids: Optional[list[str]] = None,
         type_filter: Optional[str] = None,
+        source_filter: Optional[str] = None,
     ) -> list[Source]:
         """Hybrid search (keyword + vector). Returns lightweight `Source`s."""
         vector_query = VectorizedQuery(
@@ -124,6 +129,8 @@ class SearchService:
             filter_parts.append(f"search.in(doc_id, '{','.join(doc_ids)}', ',')")
         if type_filter:
             filter_parts.append(f"type eq '{type_filter}'")
+        if source_filter:
+            filter_parts.append(f"source eq '{source_filter}'")
         filter_expr: Optional[str] = " and ".join(filter_parts) if filter_parts else None
 
         results = self._search_client.search(
@@ -131,7 +138,7 @@ class SearchService:
             vector_queries=[vector_query],
             filter=filter_expr,
             top=top_k,
-            select=["id", "doc_id", "page", "type", "content", "image_url"],
+            select=["id", "doc_id", "page", "type", "content", "image_url", "caption", "source"],
         )
         
         sources: list[Source] = []
@@ -145,6 +152,8 @@ class SearchService:
                     type=r.get("type", "text"),
                     snippet=(r.get("content") or "")[:400],
                     image_url=r.get("image_url"),
+                    caption=r.get("caption"),
+                    source=r.get("source"),
                 )
             )
         return sources

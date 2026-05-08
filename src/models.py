@@ -71,6 +71,9 @@ class ChunkRecord(BaseModel):
     type: Literal["text", "table", "image"] = "text"
     content: str
     image_url: Optional[str] = None
+    caption: Optional[str] = None
+    # Provenance for image chunks: "figure" (DI) | "raster" (PyMuPDF) | None for text/table
+    source: Optional[Literal["figure", "raster"]] = None
     embedding: Optional[list[float]] = None
 
 
@@ -84,6 +87,8 @@ class Source(BaseModel):
     type: str
     snippet: str
     image_url: Optional[str] = None
+    caption: Optional[str] = None
+    source: Optional[str] = None
 
 
 class ChatTurn(BaseModel):

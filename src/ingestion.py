@@ -23,6 +23,13 @@ import logging
 from datetime import datetime, timezone
 
 from src.blob_client import BlobService
+from src.chunking import (
+    CHUNK_OVERLAP,
+    CHUNK_TOKENS,
+    MIN_IMAGE_BYTES,
+    assemble_chunks,
+    build_image_chunks,
+)
 from src.cosmos_client import CosmosService
 from src.doc_intelligence import DocIntelService
 from src.models import ChunkRecord, DocumentMeta, StageEvent
@@ -30,10 +37,6 @@ from src.openai_client import OpenAIService
 from src.search_client import SearchService
 
 log = logging.getLogger(__name__)
-
-CHUNK_TOKENS = 500       # approx tokens — we use chars/4 as proxy
-CHUNK_OVERLAP = 80
-MIN_IMAGE_BYTES = 5_000  # skip icons / bullets
 
 
 class IngestionPipeline:
@@ -105,6 +108,7 @@ class IngestionPipeline:
             extracted = self.doc_intel.extract_pdf(blob_url)
             text_chunks = extracted["text_chunks"]
             tables = extracted["tables"]
+            figures = extracted.get("figures", [])
             doc.total_pages = extracted["pages"]
             doc.total_tables = len(tables)
             self._stage(
@@ -114,19 +118,22 @@ class IngestionPipeline:
                 detail=f"{doc.total_pages} pages, {doc.total_tables} tables",
             )
 
-            # 3. Embedded images via PyMuPDF
+            # 3. Hybrid image extraction: DI figures + PyMuPDF rasters
             self._stage(doc, "extract_images", "running")
-            image_chunks = self._extract_images(pdf_bytes, doc.id)
+            image_chunks = self._extract_images(pdf_bytes, doc.id, figures)
             doc.total_images = len(image_chunks)
             self._stage(doc, "extract_images", "done", detail=f"{doc.total_images} images")
 
             # 4. Smart-chunk text (tables/images stay whole)
             self._stage(doc, "chunk", "running")
-            page_text_chunks = self._smart_chunk_text(text_chunks, doc.id)
-            all_chunks: list[ChunkRecord] = page_text_chunks + [
-                ChunkRecord(doc_id=doc.id, page=t["page"], type="table", content=t["content"])
-                for t in tables
-            ] + image_chunks
+            all_chunks: list[ChunkRecord] = assemble_chunks(
+                doc_id=doc.id,
+                text_pages=text_chunks,
+                tables=tables,
+                image_chunks=image_chunks,
+                chunk_tokens=CHUNK_TOKENS,
+                chunk_overlap=CHUNK_OVERLAP,
+            )
             self._stage(doc, "chunk", "done", detail=f"{len(all_chunks)} chunks")
 
             # 5. Embed
@@ -171,46 +178,22 @@ class IngestionPipeline:
             raise
 
     # ------------------------------------------------------------------
-    def _extract_images(self, pdf_bytes: bytes, doc_id: str) -> list[ChunkRecord]:
-        """Pull embedded images out of the PDF, describe via GPT-4o vision."""
+    def _extract_images(
+        self,
+        pdf_bytes: bytes,
+        doc_id: str,
+        figures: list | None = None,
+    ) -> list[ChunkRecord]:
+        """Hybrid image extraction (DI figures + PyMuPDF rasters), described
+        via GPT-4o vision. Captions from DI are used as hints for the vision
+        model and prepended to the description when missing.
+        """
         images = self.doc_intel.extract_images(
             pdf_bytes,
             doc_id,
             blob=self.blob,
             openai=self.openai,
+            figures=figures,
             min_image_bytes=MIN_IMAGE_BYTES,
         )
-        return [
-            ChunkRecord(
-                doc_id=doc_id,
-                page=img["page"],
-                type="image",
-                content=f"[Image on page {img['page']}]: {img['description']}",
-                image_url=img["image_url"],
-            )
-            for img in images
-        ]
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _smart_chunk_text(page_chunks: list[dict], doc_id: str) -> list[ChunkRecord]:
-        """Sliding window over page text. Each chunk keeps its page number."""
-        out: list[ChunkRecord] = []
-        max_chars = CHUNK_TOKENS * 4
-        overlap = CHUNK_OVERLAP * 4
-        for pc in page_chunks:
-            text: str = pc["content"]
-            page: int = pc["page"]
-            if len(text) <= max_chars:
-                out.append(ChunkRecord(doc_id=doc_id, page=page, type="text", content=text))
-                continue
-            start = 0
-            while start < len(text):
-                end = min(start + max_chars, len(text))
-                out.append(
-                    ChunkRecord(doc_id=doc_id, page=page, type="text", content=text[start:end])
-                )
-                if end >= len(text):
-                    break
-                start = end - overlap
-        return out
+        return build_image_chunks(images, doc_id)
