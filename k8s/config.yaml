@@ -16,13 +16,17 @@ data:
   COSMOS_ENDPOINT: "https://db-ragtp4omni.documents.azure.com:443/"
   COSMOS_DATABASE: "docmind"
   DOCMIND_DISABLE_AUTH: "false"
+  # Redis (chat memory). Non-secret prefix only; REDIS_URL lives in the Secret
+  # because it embeds the Azure Cache for Redis access key.
+  REDIS_PREFIX: "docmind"
 ---
 # Replace placeholders, then:
 #   kubectl create secret generic docmind-secrets -n docmind \
 #     --from-literal=AZURE_OPENAI_KEY=... \
 #     --from-literal=AZURE_DOCUMENT_INTELLIGENCE_KEY=... \
 #     --from-literal=COSMOS_KEY=... \
-#     --from-literal=AZURE_SEARCH_ADMIN_KEY=...
+#     --from-literal=AZURE_SEARCH_ADMIN_KEY=... \
+#     --from-literal=REDIS_URL='rediss://:<access-key>@<name>.redis.cache.windows.net:6380/0'
 apiVersion: v1
 kind: Secret
 metadata:
@@ -34,3 +38,5 @@ stringData:
   AZURE_DOCUMENT_INTELLIGENCE_KEY: REPLACE
   COSMOS_KEY: REPLACE
   AZURE_SEARCH_ADMIN_KEY: REPLACE
+  # Format: rediss://:<access-key>@<name>.redis.cache.windows.net:6380/0
+  REDIS_URL: REPLACE
