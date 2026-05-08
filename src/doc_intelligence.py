@@ -19,13 +19,20 @@ Image bytes are produced by a hybrid pipeline:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Optional
 
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeResult, AnalyzeDocumentRequest
 from azure.core.credentials import AzureKeyCredential
 
 import config
+from src.models import (
+    ExtractedChunk,
+    ExtractedImage,
+    ExtractedParagraph,
+    ExtractedSection,
+    ExtractedTable,
+)
 
 if TYPE_CHECKING:  # avoid hard runtime deps for static typing
     from src.blob_client import BlobService
@@ -33,30 +40,19 @@ if TYPE_CHECKING:  # avoid hard runtime deps for static typing
 
 log = logging.getLogger(__name__)
 
-# Skip thumbnails, bullets, decorative icons.
-MIN_IMAGE_BYTES = 5_000
-# DPI used when rasterizing a page region for a DI-detected figure.
-FIGURE_RENDER_DPI = 200
-# IoU threshold above which a PyMuPDF-extracted raster is considered a
-# duplicate of a DI figure on the same page.
-DEDUP_IOU = 0.4
+# Resolved from config so callers importing this module still get the values.
+MIN_IMAGE_BYTES = config.DOC_INTEL_MIN_IMAGE_BYTES
+FIGURE_RENDER_DPI = config.DOC_INTEL_FIGURE_RENDER_DPI
+DEDUP_IOU = config.DOC_INTEL_DEDUP_IOU
+
+NEIGHBOR_PARAGRAPHS_BEFORE = config.DOC_INTEL_NEIGHBOR_PARAGRAPHS_BEFORE
+NEIGHBOR_PARAGRAPHS_AFTER = config.DOC_INTEL_NEIGHBOR_PARAGRAPHS_AFTER
 
 
-class ExtractedChunk(TypedDict):
-    content: str
-    page: int
-    type: str  # "text" | "table"
-
-
-class ExtractedImage(TypedDict):
-    page: int
-    image_url: str
-    blob_name: str
-    description: str
-    ext: str
-    size_bytes: int
-    source: str  # "figure" (DI) | "raster" (PyMuPDF)
-    caption: str
+# Number of surrounding paragraphs (in same section, by reading order)
+# attached to a table or figure as "nearby explanation" context.
+NEIGHBOR_PARAGRAPHS_BEFORE = 2
+NEIGHBOR_PARAGRAPHS_AFTER = 1
 
 
 class DocIntelService:
@@ -79,9 +75,13 @@ class DocIntelService:
         Returns
         -------
         dict with keys:
-            * `pages`: number of pages
-            * `text_chunks`: list[ExtractedChunk]   one per page
-            * `tables`:      list[ExtractedChunk]   one per detected table
+            * ``pages``        — number of pages
+            * ``text_chunks``  — list[ExtractedChunk]   one per page (legacy)
+            * ``tables``       — list[ExtractedTable]   rich, with bbox/section
+            * ``paragraphs``   — list[ExtractedParagraph] in reading order
+            * ``sections``     — list[ExtractedSection]   with parent/child ids
+            * ``figures``      — raw DI figure objects (consumed by extract_images)
+            * ``figures_meta`` — list[dict] section/neighbor lookup keyed by figure_id
         """
         log.info("Document Intelligence analysing %s", blob_url[:80])
         # Note: `prebuilt-layout` returns `result.figures` automatically — there
@@ -93,6 +93,7 @@ class DocIntelService:
         )
         result: AnalyzeResult = poller.result()
 
+        # ---- per-page raw text (legacy text_chunks) ------------------
         text_chunks: list[ExtractedChunk] = []
         for page in result.pages or []:
             lines = [ln.content for ln in (page.lines or []) if ln.content]
@@ -102,21 +103,195 @@ class DocIntelService:
                     {"content": page_text, "page": page.page_number, "type": "text"}
                 )
 
-        tables: list[ExtractedChunk] = []
-        for table in result.tables or []:
-            md = self._table_to_markdown(table)
-            page_no = (
-                table.bounding_regions[0].page_number
-                if table.bounding_regions
-                else 0
+        # ---- paragraphs (reading order) ------------------------------
+        paragraphs: list[ExtractedParagraph] = []
+        for i, p in enumerate(result.paragraphs or []):
+            page_no, bbox = self._region_to_page_bbox(getattr(p, "bounding_regions", None))
+            paragraphs.append(
+                {
+                    "id": f"p{i}",
+                    "content": (p.content or "").strip(),
+                    "page": page_no,
+                    "bbox": bbox,
+                    "role": getattr(p, "role", None),
+                    "reading_order": i,
+                    "section_id": None,  # filled below
+                }
             )
-            tables.append({"content": md, "page": page_no, "type": "table"})
+
+        # ---- sections + parent/child wiring --------------------------
+        # DI returns sections with `elements` like "/paragraphs/12",
+        # "/sections/3", "/tables/0", "/figures/1" — we resolve these
+        # into typed id lists and a parent map.
+        raw_sections = list(result.sections or [])
+        # First pass: collect element refs and direct children sections
+        section_records: list[dict] = []
+        para_to_section: dict[int, int] = {}      # paragraph index -> section index
+        table_to_section: dict[int, int] = {}
+        figure_to_section: dict[int, int] = {}
+        child_to_parent: dict[int, int] = {}      # section index -> parent section index
+        for s_idx, sec in enumerate(raw_sections):
+            paragraph_idxs: list[int] = []
+            table_idxs: list[int] = []
+            figure_idxs: list[int] = []
+            for elem in getattr(sec, "elements", None) or []:
+                kind, idx = self._parse_element_ref(elem)
+                if kind == "paragraphs" and idx is not None:
+                    paragraph_idxs.append(idx)
+                    para_to_section.setdefault(idx, s_idx)
+                elif kind == "tables" and idx is not None:
+                    table_idxs.append(idx)
+                    table_to_section.setdefault(idx, s_idx)
+                elif kind == "figures" and idx is not None:
+                    figure_idxs.append(idx)
+                    figure_to_section.setdefault(idx, s_idx)
+                elif kind == "sections" and idx is not None:
+                    child_to_parent.setdefault(idx, s_idx)
+            section_records.append(
+                {
+                    "paragraph_idxs": paragraph_idxs,
+                    "table_idxs": table_idxs,
+                    "figure_idxs": figure_idxs,
+                }
+            )
+
+        # Compute level + path for each section (BFS from roots).
+        levels: dict[int, int] = {}
+        paths: dict[int, list[str]] = {}
+
+        def _heading_for(s_idx: int) -> str:
+            rec = section_records[s_idx]
+            for pi in rec["paragraph_idxs"]:
+                if 0 <= pi < len(paragraphs):
+                    role = paragraphs[pi]["role"]
+                    if role in ("title", "sectionHeading"):
+                        return paragraphs[pi]["content"]
+            # Fall back to first paragraph's content trimmed
+            if rec["paragraph_idxs"]:
+                pi = rec["paragraph_idxs"][0]
+                if 0 <= pi < len(paragraphs):
+                    return paragraphs[pi]["content"][:80]
+            return f"Section {s_idx}"
+
+        for s_idx in range(len(raw_sections)):
+            # Walk up parents
+            chain = [s_idx]
+            cur = s_idx
+            seen = {s_idx}
+            while cur in child_to_parent:
+                parent = child_to_parent[cur]
+                if parent in seen:
+                    break  # defensive: avoid cycles
+                chain.append(parent)
+                seen.add(parent)
+                cur = parent
+            chain.reverse()  # root -> self
+            levels[s_idx] = len(chain)
+            paths[s_idx] = [_heading_for(i) for i in chain]
+
+        # Build sections list and back-fill paragraph.section_id
+        sections: list[ExtractedSection] = []
+        for s_idx, rec in enumerate(section_records):
+            sec_id = f"s{s_idx}"
+            for pi in rec["paragraph_idxs"]:
+                if 0 <= pi < len(paragraphs):
+                    paragraphs[pi]["section_id"] = sec_id
+            min_order = min(
+                (paragraphs[pi]["reading_order"] for pi in rec["paragraph_idxs"]
+                 if 0 <= pi < len(paragraphs)),
+                default=10**9,
+            )
+            sections.append(
+                {
+                    "id": sec_id,
+                    "heading": paths[s_idx][-1] if paths[s_idx] else f"Section {s_idx}",
+                    "level": levels.get(s_idx, 1),
+                    "path": paths[s_idx],
+                    "parent_id": (
+                        f"s{child_to_parent[s_idx]}" if s_idx in child_to_parent else None
+                    ),
+                    "paragraph_ids": [f"p{pi}" for pi in rec["paragraph_idxs"]],
+                    "table_ids": [f"t{ti}" for ti in rec["table_idxs"]],
+                    "figure_ids": [f"f{fi}" for fi in rec["figure_idxs"]],
+                    "reading_order": min_order,
+                }
+            )
+
+        # ---- tables (rich) -------------------------------------------
+        tables: list[ExtractedTable] = []
+        for t_idx, table in enumerate(result.tables or []):
+            md = self._table_to_markdown(table)
+            page_no, bbox = self._region_to_page_bbox(
+                getattr(table, "bounding_regions", None)
+            )
+            caption = ""
+            try:
+                if getattr(table, "caption", None) and table.caption.content:
+                    caption = table.caption.content.strip()
+            except AttributeError:
+                caption = ""
+            sec_idx = table_to_section.get(t_idx)
+            sec_id = f"s{sec_idx}" if sec_idx is not None else None
+            sec_path = " > ".join(paths[sec_idx]) if sec_idx is not None else None
+            neighbors = self._neighbor_paragraphs_for_element(
+                element_kind="table",
+                bbox=bbox,
+                page=page_no,
+                section_idx=sec_idx,
+                section_records=section_records,
+                paragraphs=paragraphs,
+            )
+            tables.append(
+                {
+                    "id": f"t{t_idx}",
+                    "content": md,
+                    "page": page_no,
+                    "bbox": bbox,
+                    "caption": caption,
+                    "section_id": sec_id,
+                    "section_path": sec_path,
+                    "reading_order": neighbors["reading_order_anchor"],
+                    "neighbor_paragraph_ids": neighbors["ids"],
+                }
+            )
+
+        # ---- figures_meta (consumed by extract_images) ---------------
+        figures_meta: list[dict] = []
+        for f_idx, fig in enumerate(result.figures or []):
+            page_no, bbox = self._region_to_page_bbox(
+                getattr(fig, "bounding_regions", None)
+            )
+            sec_idx = figure_to_section.get(f_idx)
+            sec_id = f"s{sec_idx}" if sec_idx is not None else None
+            sec_path = " > ".join(paths[sec_idx]) if sec_idx is not None else None
+            neighbors = self._neighbor_paragraphs_for_element(
+                element_kind="figure",
+                bbox=bbox,
+                page=page_no,
+                section_idx=sec_idx,
+                section_records=section_records,
+                paragraphs=paragraphs,
+            )
+            figures_meta.append(
+                {
+                    "id": f"f{f_idx}",
+                    "page": page_no,
+                    "bbox": bbox,
+                    "section_id": sec_id,
+                    "section_path": sec_path,
+                    "neighbor_paragraph_ids": neighbors["ids"],
+                    "reading_order": neighbors["reading_order_anchor"],
+                }
+            )
 
         return {
             "pages": len(result.pages or []),
             "text_chunks": text_chunks,
             "tables": tables,
+            "paragraphs": paragraphs,
+            "sections": sections,
             "figures": list(result.figures or []),
+            "figures_meta": figures_meta,
         }
 
     # ------------------------------------------------------------------
@@ -127,6 +302,7 @@ class DocIntelService:
         blob: "BlobService",
         openai: Optional["OpenAIService"] = None,
         figures: Optional[list[Any]] = None,
+        figures_meta: Optional[list[dict]] = None,
         min_image_bytes: int = MIN_IMAGE_BYTES,
         render_dpi: int = FIGURE_RENDER_DPI,
     ) -> list[ExtractedImage]:
@@ -148,12 +324,17 @@ class DocIntelService:
 
         Pass ``figures`` from :py:meth:`extract_pdf` (the ``"figures"``
         key) to enable step 1. If omitted, falls back to PyMuPDF only.
+        Pass ``figures_meta`` from :py:meth:`extract_pdf` (the
+        ``"figures_meta"`` key) to attach section / neighbor metadata
+        onto each emitted figure-source image (used by chunking).
         """
         import fitz  # PyMuPDF — local import keeps import cost off cold paths
 
         out: list[ExtractedImage] = []
         # page_number -> list[fitz.Rect] of regions already captured (for dedup)
         captured_rects: dict[int, list["fitz.Rect"]] = {}
+        # Quick lookup: figure_id "f<idx>" -> meta dict
+        meta_by_id: dict[str, dict] = {m["id"]: m for m in (figures_meta or [])}
 
         pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         try:
@@ -165,6 +346,9 @@ class DocIntelService:
                         caption = fig.caption.content.strip()
                 except AttributeError:
                     caption = ""
+
+                fig_id = f"f{fi}"
+                fmeta = meta_by_id.get(fig_id, {})
 
                 for br_idx, br in enumerate(fig.bounding_regions or []):
                     page_num = br.page_number
@@ -200,6 +384,15 @@ class DocIntelService:
                             "size_bytes": len(image_bytes),
                             "source": "figure",
                             "caption": caption,
+                            "figure_id": fig_id,
+                            "bbox": fmeta.get("bbox") or [
+                                rect.x0, rect.y0, rect.x1, rect.y1,
+                            ],
+                            "section_id": fmeta.get("section_id"),
+                            "section_path": fmeta.get("section_path"),
+                            "neighbor_paragraph_ids": list(
+                                fmeta.get("neighbor_paragraph_ids") or []
+                            ),
                         }
                     )
                     captured_rects.setdefault(page_num, []).append(rect)
@@ -236,6 +429,10 @@ class DocIntelService:
                     image_url = blob.get_url(blob_name)
 
                     description = self._describe(openai, image_url, "", blob_name)
+                    raster_bbox = None
+                    if placements:
+                        r = placements[0]
+                        raster_bbox = [r.x0, r.y0, r.x1, r.y1]
                     out.append(
                         {
                             "page": page_num,
@@ -246,6 +443,11 @@ class DocIntelService:
                             "size_bytes": len(image_bytes),
                             "source": "raster",
                             "caption": "",
+                            "figure_id": None,
+                            "bbox": raster_bbox,
+                            "section_id": None,
+                            "section_path": None,
+                            "neighbor_paragraph_ids": [],
                         }
                     )
                     if placements:
@@ -331,6 +533,106 @@ class DocIntelService:
         area_b = max(0.0, b.x1 - b.x0) * max(0.0, b.y1 - b.y0)
         union = area_a + area_b - inter
         return inter / union if union > 0 else 0.0
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _region_to_page_bbox(bounding_regions) -> tuple[int, Optional[list[float]]]:
+        """Return (page_number, bbox-in-points) from a DI bounding_regions list.
+
+        Falls back to (0, None) when no region is present.
+        """
+        if not bounding_regions:
+            return 0, None
+        br = bounding_regions[0]
+        page_no = getattr(br, "page_number", 0) or 0
+        polygon = getattr(br, "polygon", None) or []
+        if not polygon:
+            return page_no, None
+        if hasattr(polygon[0], "x"):
+            xs = [float(p.x) for p in polygon]
+            ys = [float(p.y) for p in polygon]
+        else:
+            xs = [float(v) for v in polygon[0::2]]
+            ys = [float(v) for v in polygon[1::2]]
+        if not xs or not ys:
+            return page_no, None
+        # DI returns inches by default — convert to PDF points (72 / inch).
+        x0, x1 = min(xs) * 72.0, max(xs) * 72.0
+        y0, y1 = min(ys) * 72.0, max(ys) * 72.0
+        return page_no, [x0, y0, x1, y1]
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_element_ref(ref: str) -> tuple[Optional[str], Optional[int]]:
+        """Parse DI element refs like '/paragraphs/12' -> ('paragraphs', 12)."""
+        if not isinstance(ref, str) or not ref.startswith("/"):
+            return None, None
+        parts = ref.strip("/").split("/")
+        if len(parts) < 2:
+            return None, None
+        kind = parts[0]
+        try:
+            idx = int(parts[1])
+        except (TypeError, ValueError):
+            return kind, None
+        return kind, idx
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _neighbor_paragraphs_for_element(
+        *,
+        element_kind: str,
+        bbox: Optional[list[float]],
+        page: int,
+        section_idx: Optional[int],
+        section_records: list[dict],
+        paragraphs: list,
+    ) -> dict:
+        """Find paragraphs that contextualize a table or figure.
+
+        Strategy: look only inside the same DI section. Take the
+        ``NEIGHBOR_PARAGRAPHS_BEFORE`` paragraphs immediately preceding
+        the element's reading-order position and the
+        ``NEIGHBOR_PARAGRAPHS_AFTER`` immediately following — these are
+        what humans treat as the "caption / explanation" region.
+
+        Returns a dict ``{"ids": [...], "reading_order_anchor": int}``.
+        """
+        if section_idx is None or not (0 <= section_idx < len(section_records)):
+            return {"ids": [], "reading_order_anchor": 10**9}
+        para_idxs = section_records[section_idx]["paragraph_idxs"]
+        if not para_idxs:
+            return {"ids": [], "reading_order_anchor": 10**9}
+
+        # Anchor = approximate insertion point of this element in the
+        # section's paragraph list. DI does not give a paragraph-relative
+        # offset for tables/figures, so we use the *closest paragraph by
+        # vertical position on the same page* as the anchor.
+        anchor_pos = len(para_idxs)  # default: element after section text
+        if bbox is not None:
+            best_dist = None
+            for pos, pi in enumerate(para_idxs):
+                if 0 <= pi < len(paragraphs):
+                    p = paragraphs[pi]
+                    if p["page"] != page or p["bbox"] is None:
+                        continue
+                    # vertical distance of paragraph midline to element top
+                    p_mid_y = (p["bbox"][1] + p["bbox"][3]) / 2.0
+                    dist = abs(p_mid_y - bbox[1])
+                    if best_dist is None or dist < best_dist:
+                        best_dist = dist
+                        anchor_pos = pos + 1  # element comes after this para
+        before = para_idxs[max(0, anchor_pos - NEIGHBOR_PARAGRAPHS_BEFORE):anchor_pos]
+        after = para_idxs[anchor_pos:anchor_pos + NEIGHBOR_PARAGRAPHS_AFTER]
+        ids = [f"p{pi}" for pi in (before + after)]
+        # reading_order anchor = order of last "before" paragraph + 0.5,
+        # so element sorts naturally between text chunks.
+        anchor_order: int = 10**9
+        if before and 0 <= before[-1] < len(paragraphs):
+            anchor_order = paragraphs[before[-1]]["reading_order"] + 1
+        elif after and 0 <= after[0] < len(paragraphs):
+            anchor_order = max(0, paragraphs[after[0]]["reading_order"] - 1)
+        return {"ids": ids, "reading_order_anchor": anchor_order}
 
     # ------------------------------------------------------------------
     @staticmethod

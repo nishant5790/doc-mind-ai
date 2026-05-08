@@ -28,6 +28,8 @@ from typing import Optional
 
 from src.models import ChatTurn
 
+import config
+
 log = logging.getLogger(__name__)
 
 
@@ -74,7 +76,7 @@ class _InMemoryFallback:
 class RedisChatMemory:
     """Persistent chat-history store backed by Redis."""
 
-    def __init__(self, url: Optional[str] = None, prefix: str = "docmind", history_limit: int = 200) -> None:
+    def __init__(self, url: Optional[str] = None, prefix: str = "docmind", history_limit: int = config.REDIS_HISTORY_LIMIT) -> None:
         self._prefix = prefix
         self._history_limit = history_limit
         self._client = None

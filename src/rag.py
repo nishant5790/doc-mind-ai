@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from typing import AsyncIterator, Optional
 
+import config
 from src.cosmos_client import CosmosService
 from src.models import ChatTurn, Source
 from src.openai_client import OpenAIService
@@ -73,7 +74,7 @@ class RAGEngine:
         "stages", "sequence", "structure",
     )
     # Final score (0..1) at or above which we run the image-only search pass.
-    _VISUAL_INTENT_THRESHOLD = 0.6
+    _VISUAL_INTENT_THRESHOLD = config.RAG_VISUAL_INTENT_THRESHOLD
     # Weights blending the two signals.
     _STRONG_KEYWORD_SCORE = 1.0
     _WEAK_KEYWORD_SCORE = 0.5
@@ -81,7 +82,7 @@ class RAGEngine:
     # Threshold below which a chunk that has received explicit feedback is
     # treated as "learned bad" and excluded from results. quality_score is
     # good/(good+bad), so a single 👎 with no 👍 yields 0.0.
-    _BAD_QUALITY_THRESHOLD = 0.3
+    _BAD_QUALITY_THRESHOLD = config.RAG_BAD_QUALITY_THRESHOLD
 
     # ------------------------------------------------------------------
     def _keyword_visual_score(self, question: str) -> float:

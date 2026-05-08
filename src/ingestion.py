@@ -19,6 +19,7 @@ driven from notebooks, the FastAPI app, or the background worker.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timezone
 
@@ -100,37 +101,54 @@ class IngestionPipeline:
             # 1. Download PDF
             self._stage(doc, "download", "running")
             pdf_bytes = self.blob.download_from(source_container, doc.blob_name)
+            # Stable, content-addressed identifier — propagated onto every
+            # chunk so multi-PDF retrieval / dedup / deletion stays clean
+            # even if the doc_id (UUID) is regenerated for a re-upload.
+            doc_hash = hashlib.sha256(pdf_bytes).hexdigest()
             self._stage(doc, "download", "done", detail=f"{len(pdf_bytes)} bytes")
 
-            # 2. Document Intelligence — text + tables
+            # 2. Document Intelligence — paragraphs / sections / tables / figures
             self._stage(doc, "extract_text", "running")
             blob_url = self.blob.url_for(source_container, doc.blob_name)
             extracted = self.doc_intel.extract_pdf(blob_url)
-            text_chunks = extracted["text_chunks"]
-            tables = extracted["tables"]
+            text_chunks = extracted["text_chunks"]      # legacy fallback
+            tables = extracted["tables"]                 # rich (with bbox/section)
             figures = extracted.get("figures", [])
+            figures_meta = extracted.get("figures_meta", [])
+            paragraphs = extracted.get("paragraphs", [])
+            sections = extracted.get("sections", [])
             doc.total_pages = extracted["pages"]
             doc.total_tables = len(tables)
             self._stage(
                 doc,
                 "extract_text",
                 "done",
-                detail=f"{doc.total_pages} pages, {doc.total_tables} tables",
+                detail=(
+                    f"{doc.total_pages} pages, {doc.total_tables} tables, "
+                    f"{len(paragraphs)} paragraphs, {len(sections)} sections"
+                ),
             )
 
             # 3. Hybrid image extraction: DI figures + PyMuPDF rasters
             self._stage(doc, "extract_images", "running")
-            image_chunks = self._extract_images(pdf_bytes, doc.id, figures)
+            image_chunks = self._extract_images(
+                pdf_bytes, doc.id, figures, figures_meta=figures_meta,
+                doc_filename=doc.filename, doc_hash=doc_hash, paragraphs=paragraphs,
+            )
             doc.total_images = len(image_chunks)
             self._stage(doc, "extract_images", "done", detail=f"{doc.total_images} images")
 
-            # 4. Smart-chunk text (tables/images stay whole)
+            # 4. Section-aware chunking with parent-child links
             self._stage(doc, "chunk", "running")
             all_chunks: list[ChunkRecord] = assemble_chunks(
                 doc_id=doc.id,
                 text_pages=text_chunks,
                 tables=tables,
                 image_chunks=image_chunks,
+                paragraphs=paragraphs,
+                sections=sections,
+                doc_filename=doc.filename,
+                doc_hash=doc_hash,
                 chunk_tokens=CHUNK_TOKENS,
                 chunk_overlap=CHUNK_OVERLAP,
             )
@@ -183,10 +201,16 @@ class IngestionPipeline:
         pdf_bytes: bytes,
         doc_id: str,
         figures: list | None = None,
+        figures_meta: list | None = None,
+        doc_filename: str | None = None,
+        doc_hash: str | None = None,
+        paragraphs: list | None = None,
     ) -> list[ChunkRecord]:
         """Hybrid image extraction (DI figures + PyMuPDF rasters), described
         via GPT-4o vision. Captions from DI are used as hints for the vision
-        model and prepended to the description when missing.
+        model and prepended to the description when missing. Section /
+        neighbor metadata from `figures_meta` is folded into each image
+        chunk so retrieval can pull related text alongside the figure.
         """
         images = self.doc_intel.extract_images(
             pdf_bytes,
@@ -194,6 +218,13 @@ class IngestionPipeline:
             blob=self.blob,
             openai=self.openai,
             figures=figures,
+            figures_meta=figures_meta,
             min_image_bytes=MIN_IMAGE_BYTES,
         )
-        return build_image_chunks(images, doc_id)
+        return build_image_chunks(
+            images,
+            paragraphs or [],
+            doc_id=doc_id,
+            doc_filename=doc_filename,
+            doc_hash=doc_hash,
+        )

@@ -8,7 +8,7 @@ shape of records persisted to Cosmos DB and Azure AI Search.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Literal, Optional, TypedDict
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -63,10 +63,23 @@ class DocumentMeta(BaseModel):
 # Chunk record (stored in AI Search)
 # ---------------------------------------------------------------------------
 class ChunkRecord(BaseModel):
-    """A single retrievable chunk indexed in Azure AI Search."""
+    """A single retrievable chunk indexed in Azure AI Search.
+
+    Carries enough layout / hierarchy metadata to support:
+      * section-aware retrieval (`section_path`, `section_level`)
+      * parent-child reconstruction (`parent_id`, `element_id`)
+      * spatial grouping with figures / tables (`bbox`, `page`)
+      * stable multi-document identification (`doc_id`, `doc_hash`,
+        `doc_filename`)
+      * deterministic ordering across a doc (`reading_order`)
+    """
 
     id: str = Field(default_factory=_new_id)
     doc_id: str
+    # Stable identifiers for the source PDF — make multi-doc filtering
+    # and de-dup safe even if `doc_id` (a UUID) is regenerated.
+    doc_filename: Optional[str] = None
+    doc_hash: Optional[str] = None  # sha256 of the source bytes
     page: int = 0
     type: Literal["text", "table", "image"] = "text"
     content: str
@@ -74,6 +87,23 @@ class ChunkRecord(BaseModel):
     caption: Optional[str] = None
     # Provenance for image chunks: "figure" (DI) | "raster" (PyMuPDF) | None for text/table
     source: Optional[Literal["figure", "raster"]] = None
+    # ---- Layout / hierarchy -----------------------------------------
+    # Section path in document order, e.g. "1. Introduction > Background".
+    section_path: Optional[str] = None
+    section_id: Optional[str] = None
+    section_level: Optional[int] = None
+    # For table / image chunks: the id of the synthetic "parent" text
+    # chunk in the same section (or the section anchor) so the UI can
+    # show siblings. For text chunks: usually None.
+    parent_id: Optional[str] = None
+    # The DI element reference, e.g. "/tables/3" or "/figures/2" — useful
+    # for traceability back to the raw analyse result.
+    element_id: Optional[str] = None
+    # Bounding box on `page`, in PDF points (x0, y0, x1, y1). Union of
+    # all source paragraphs / table / figure regions on that page.
+    bbox: Optional[list[float]] = None
+    # Global reading order within the document (0-based).
+    reading_order: Optional[int] = None
     embedding: Optional[list[float]] = None
 
 
@@ -83,12 +113,16 @@ class ChunkRecord(BaseModel):
 class Source(BaseModel):
     chunk_id: str
     doc_id: str
+    doc_filename: Optional[str] = None
     page: int
     type: str
     snippet: str
     image_url: Optional[str] = None
     caption: Optional[str] = None
     source: Optional[str] = None
+    section_path: Optional[str] = None
+    parent_id: Optional[str] = None
+    score: Optional[float] = None
 
 
 class ChatTurn(BaseModel):
@@ -182,3 +216,62 @@ class IngestionTask(BaseModel):
     created_at: str = Field(default_factory=_utcnow)
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Document Intelligence extraction types
+# ---------------------------------------------------------------------------
+class ExtractedChunk(TypedDict):
+    content: str
+    page: int
+    type: str  # "text" | "table"
+
+
+class ExtractedParagraph(TypedDict):
+    id: str               # "p<index>" — index in result.paragraphs
+    content: str
+    page: int
+    bbox: Optional[list[float]]  # [x0,y0,x1,y1] in PDF points, or None
+    role: Optional[str]   # DI role: "title" | "sectionHeading" | "pageHeader"...
+    reading_order: int    # global index in document reading order
+    section_id: Optional[str]
+
+
+class ExtractedSection(TypedDict):
+    id: str               # "s<index>"
+    heading: str
+    level: int            # 1 = root
+    path: list[str]       # ancestor headings + own heading
+    parent_id: Optional[str]
+    paragraph_ids: list[str]
+    table_ids: list[str]
+    figure_ids: list[str]
+    reading_order: int    # min reading_order of children
+
+
+class ExtractedTable(TypedDict):
+    id: str               # "t<index>"
+    content: str          # markdown
+    page: int
+    bbox: Optional[list[float]]
+    caption: str
+    section_id: Optional[str]
+    section_path: Optional[str]
+    reading_order: int
+    neighbor_paragraph_ids: list[str]
+
+
+class ExtractedImage(TypedDict):
+    page: int
+    image_url: str
+    blob_name: str
+    description: str
+    ext: str
+    size_bytes: int
+    source: str  # "figure" (DI) | "raster" (PyMuPDF)
+    caption: str
+    figure_id: Optional[str]            # "f<index>" for DI figures, else None
+    bbox: Optional[list[float]]
+    section_id: Optional[str]
+    section_path: Optional[str]
+    neighbor_paragraph_ids: list[str]

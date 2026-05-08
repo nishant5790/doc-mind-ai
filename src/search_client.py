@@ -10,15 +10,24 @@ src/search_client.py — Azure AI Search wrapper.
 Index schema
 ------------
 fields:
-    id          (key, string)
-    doc_id      (filterable string)
-    page        (filterable int32)
-    type        (filterable string)
-    source      (filterable string)   — "figure" | "raster" for image chunks
-    content     (searchable text, en.lucene)
-    caption     (searchable text, en.lucene)
-    image_url   (string, retrievable)
-    embedding   (Collection(Edm.Single), HNSW vector field)
+    id              (key, string)
+    doc_id          (filterable string)         — UUID assigned at upload
+    doc_filename    (filterable string)         — original PDF filename
+    doc_hash        (filterable string)         — sha256 of source bytes (stable doc identity)
+    page            (filterable int32)
+    type            (filterable string)         — text | table | image
+    source          (filterable string)         — figure | raster (image chunks)
+    section_id      (filterable string)         — DI section id
+    section_path    (searchable+filterable str) — "1. Intro > Background"
+    section_level   (filterable int32)
+    parent_id       (filterable string)         — anchor text-chunk for this section
+    element_id      (filterable string)         — DI ref e.g. /tables/3, /figures/1
+    reading_order   (filterable+sortable int32)
+    bbox            (Collection(Edm.Double))    — [x0,y0,x1,y1] PDF points on `page`
+    content         (searchable text, en.lucene)
+    caption         (searchable text, en.lucene)
+    image_url       (string, retrievable)
+    embedding       (Collection(Edm.Single), HNSW vector field)
 """
 
 from __future__ import annotations
@@ -72,9 +81,21 @@ class SearchService:
         fields = [
             SimpleField(name="id", type=SearchFieldDataType.String, key=True),
             SimpleField(name="doc_id", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="doc_filename", type=SearchFieldDataType.String, filterable=True, facetable=True),
+            SimpleField(name="doc_hash", type=SearchFieldDataType.String, filterable=True),
             SimpleField(name="page", type=SearchFieldDataType.Int32, filterable=True),
             SimpleField(name="type", type=SearchFieldDataType.String, filterable=True),
             SimpleField(name="source", type=SearchFieldDataType.String, filterable=True, facetable=True),
+            SimpleField(name="section_id", type=SearchFieldDataType.String, filterable=True),
+            SearchableField(name="section_path", type=SearchFieldDataType.String, filterable=True, facetable=True, analyzer_name="en.lucene"),
+            SimpleField(name="section_level", type=SearchFieldDataType.Int32, filterable=True),
+            SimpleField(name="parent_id", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="element_id", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="reading_order", type=SearchFieldDataType.Int32, filterable=True, sortable=True),
+            SimpleField(
+                name="bbox",
+                type=SearchFieldDataType.Collection(SearchFieldDataType.Double),
+            ),
             SearchableField(name="content", type=SearchFieldDataType.String, analyzer_name="en.lucene"),
             SearchableField(name="caption", type=SearchFieldDataType.String, analyzer_name="en.lucene"),
             SimpleField(name="image_url", type=SearchFieldDataType.String),
@@ -138,8 +159,13 @@ class SearchService:
             vector_queries=[vector_query],
             filter=filter_expr,
             top=top_k,
-            select=["id", "doc_id", "page", "type", "content", "image_url", "caption", "source"],
-        )
+            select=[
+                "id", "doc_id", "doc_filename", "page", "type", "content",
+                "image_url", "caption", "source",
+                "section_path", "parent_id",
+            ],
+        )  # type: ignore
+
         
         sources: list[Source] = []
         for r in results:
@@ -148,12 +174,16 @@ class SearchService:
                 Source(
                     chunk_id=r["id"],
                     doc_id=r["doc_id"],
+                    doc_filename=r.get("doc_filename"),
                     page=r.get("page", 0),
                     type=r.get("type", "text"),
                     snippet=(r.get("content") or "")[:400],
                     image_url=r.get("image_url"),
                     caption=r.get("caption"),
                     source=r.get("source"),
+                    section_path=r.get("section_path"),
+                    parent_id=r.get("parent_id"),
+                    score=r.get("@search.score"),
                 )
             )
         return sources

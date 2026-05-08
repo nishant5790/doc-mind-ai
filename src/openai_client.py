@@ -19,7 +19,7 @@ import config
 
 log = logging.getLogger(__name__)
 
-API_VERSION = "2024-08-01-preview"
+API_VERSION = config.OPENAI_API_VERSION
 
 
 class OpenAIService:
