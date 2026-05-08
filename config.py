@@ -78,6 +78,29 @@ COSMOS_CONTAINER_TASKS: str = "ingestion_tasks"
 # Chat model
 GPT_ENGINE: str = os.environ.get("GPT_ENGINE", "gpt-4o")
 
+# Azure OpenAI REST API version
+OPENAI_API_VERSION: str = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+
+# Document Intelligence processing
+DOC_INTEL_MIN_IMAGE_BYTES: int = int(os.environ.get("DOC_INTEL_MIN_IMAGE_BYTES", "5000"))
+DOC_INTEL_FIGURE_RENDER_DPI: int = int(os.environ.get("DOC_INTEL_FIGURE_RENDER_DPI", "200"))
+DOC_INTEL_DEDUP_IOU: float = float(os.environ.get("DOC_INTEL_DEDUP_IOU", "0.4"))
+DOC_INTEL_NEIGHBOR_PARAGRAPHS_BEFORE: int = int(os.environ.get("DOC_INTEL_NEIGHBOR_BEFORE", "2"))
+DOC_INTEL_NEIGHBOR_PARAGRAPHS_AFTER: int = int(os.environ.get("DOC_INTEL_NEIGHBOR_AFTER", "1"))
+
+# Chunking
+CHUNK_TOKENS: int = int(os.environ.get("CHUNK_TOKENS", "600"))
+CHUNK_OVERLAP: int = int(os.environ.get("CHUNK_OVERLAP", "80"))
+CHUNK_HARD_SPLIT_HEADROOM: float = float(os.environ.get("CHUNK_HARD_SPLIT_HEADROOM", "1.2"))
+
+# RAG engine
+RAG_TOP_K: int = int(os.environ.get("RAG_TOP_K", "5"))
+RAG_VISUAL_INTENT_THRESHOLD: float = float(os.environ.get("RAG_VISUAL_INTENT_THRESHOLD", "0.6"))
+RAG_BAD_QUALITY_THRESHOLD: float = float(os.environ.get("RAG_BAD_QUALITY_THRESHOLD", "0.3"))
+
+# Redis chat memory
+REDIS_HISTORY_LIMIT: int = int(os.environ.get("REDIS_HISTORY_LIMIT", "200"))
+
 # Redis (chat memory) — points at local Redis in docker-compose.
 # Swap to Azure Cache for Redis by setting:
 #   REDIS_URL=rediss://:<access-key>@<name>.redis.cache.windows.net:6380/0
