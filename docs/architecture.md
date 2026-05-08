@@ -661,12 +661,21 @@ Chat turns were moved from Cosmos `sessions` to Redis for lower-latency reads an
 | Field | Type | Notes |
 |---|---|---|
 | `id` | string (key) | chunk uuid |
-| `doc_id` | string (filterable) | parent document |
+| `doc_id` | string (filterable) | parent document UUID |
+| `doc_filename` | string (filterable, facetable) | original PDF filename — multi-doc retrieval |
+| `doc_hash` | string (filterable) | sha256 of source bytes — stable doc identity / dedup |
 | `page` | int32 (filterable) | page number |
 | `type` | string (filterable) | `text` / `table` / `image` |
 | `source` | string (filterable, facetable) | image provenance: `figure` (DI) / `raster` (PyMuPDF); null for text/table |
-| `content` | searchable string (en.lucene) | text or image description (caption prepended for images) |
-| `caption` | searchable string (en.lucene) | DI figure caption verbatim (image chunks only) |
+| `section_id` | string (filterable) | DI section id (e.g. `s12`) |
+| `section_path` | searchable string (filterable, facetable, en.lucene) | full hierarchy, e.g. `"2. Introduction > 2.1 Purpose"` |
+| `section_level` | int32 (filterable) | 1 = root, deeper = nested |
+| `parent_id` | string (filterable) | id of the section's anchor text chunk — links table/image chunks back to their section |
+| `element_id` | string (filterable) | DI ref, e.g. `/tables/3`, `/figures/1` |
+| `reading_order` | int32 (filterable, sortable) | global reading-order index in the doc |
+| `bbox` | Collection(Double) | `[x0, y0, x1, y1]` in PDF points on `page` (layout coordinates) |
+| `content` | searchable string (en.lucene) | text or merged image/table body (caption + neighbors + description) |
+| `caption` | searchable string (en.lucene) | DI figure/table caption verbatim |
 | `image_url` | string (retrievable) | Blob URL for image chunks |
 | `embedding` | Collection(Single) | 1536-d vector, HNSW |
 

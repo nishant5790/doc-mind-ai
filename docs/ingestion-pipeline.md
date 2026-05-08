@@ -104,26 +104,31 @@ flowchart LR
   full pipeline.
 - **Stage detail recorded:** byte count.
 
-### Stage 2 — Document Intelligence (text + tables + figures)
+### Stage 2 — Document Intelligence (paragraphs, sections, tables, figures)
 
 ```mermaid
 flowchart LR
     A["blob URL"] -->|prebuilt-layout| DI["Azure DI"]
-    DI --> P["result.pages"]
+    DI --> P["result.paragraphs"]
+    DI --> S["result.sections"]
     DI --> T["result.tables"]
     DI --> F["result.figures + captions"]
-    P --> TC["text_chunks per page"]
-    T --> TT["tables as markdown"]
-    F --> FG["figures list (passed to stage 3)"]
+    P --> PG["paragraphs[] (id, content, page, bbox, role, reading_order, section_id)"]
+    S --> SG["sections[] (id, heading, level, path, parent_id, paragraph_ids, table_ids, figure_ids)"]
+    T --> TT["tables[] (id, content, page, bbox, caption, section_id, section_path, neighbor_paragraph_ids)"]
+    F --> FG["figures (raw, passed to stage 3)"]
+    F --> FM["figures_meta[] (id, page, bbox, section_id, section_path, neighbor_paragraph_ids)"]
 ```
 
 - **Method:** `DocIntelService.extract_pdf(blob_url)`
 - **Output:**
   - `pages: int`
-  - `text_chunks: [{content, page, type='text'}]` — one per page
-  - `tables: [{content, page, type='table'}]` — markdown-rendered
-  - `figures: list[Figure]` — DI figure objects with `bounding_regions`
-    and optional `caption.content`
+  - `text_chunks: [{content, page, type='text'}]` — one per page (legacy fallback for stage 4)
+  - `paragraphs: list[ExtractedParagraph]` — every paragraph with bbox, role, reading order, section
+  - `sections: list[ExtractedSection]` — full hierarchy (parent_id + paragraph/table/figure ids resolved from DI element refs like `/paragraphs/12`, `/tables/3`)
+  - `tables: list[ExtractedTable]` — markdown body **plus** bbox, caption, section path, and 1–2 neighbor paragraph ids ("nearby explanation")
+  - `figures: list[Figure]` — raw DI figure objects (consumed by stage 3 for cropping)
+  - `figures_meta: list[dict]` — section + neighbor lookup keyed by `f<idx>` (folded onto each emitted image in stage 3)
 - **Important:** we do **not** pass `features=['figures']`. DI returns
   `result.figures` automatically with `prebuilt-layout`; the add-on
   flag returns `InvalidArgument` from the service.
@@ -177,37 +182,91 @@ sources detect it.
 ```
 { page, image_url, blob_name, description, ext, size_bytes,
   source: "figure" | "raster",
-  caption: str (DI caption or "") }
+  caption: str (DI caption or ""),
+  figure_id: "f<idx>" | None,           # DI figure id (None for raster)
+  bbox: [x0, y0, x1, y1] | None,        # PDF points on page
+  section_id: "s<idx>" | None,
+  section_path: "1. Intro > Background" | None,
+  neighbor_paragraph_ids: ["p17", "p19"] }   # nearby paragraphs in same section
 ```
+
+The section / neighbor metadata is sourced from `figures_meta` (stage 2)
+and folded into each emitted image so chunking (stage 4) can merge in
+the surrounding text without another DI call.
 
 **Tunables** (top of [doc_intelligence.py](../src/doc_intelligence.py)):
 - `MIN_IMAGE_BYTES = 5_000` — drop icons / bullets
 - `FIGURE_RENDER_DPI = 200` — bump to 300 for crisper crops
 - `DEDUP_IOU = 0.4` — overlap above which raster is dropped as a duplicate
+- `NEIGHBOR_PARAGRAPHS_BEFORE = 2`, `NEIGHBOR_PARAGRAPHS_AFTER = 1` — context window for tables/figures
 
-### Stage 4 — Smart chunk
+### Stage 4 — Section-aware chunking (with parent-child links)
 
 ```mermaid
-flowchart LR
-    A["text_chunks per page"] --> B{"len > 2000 chars?"}
-    B -->|no| C["1 chunk"]
-    B -->|yes| D["Sliding window 2000 chars / 320 overlap"]
-    D --> E["N chunks (same page)"]
-    C --> F["Combined chunk list"]
-    E --> F
-    G["tables"] --> F
-    H["image_chunks"] --> F
+flowchart TB
+    subgraph Inputs
+      P["paragraphs[] + sections[]"]
+      T["tables[] (with caption + neighbors)"]
+      I["image_chunks[] (built in stage 3)"]
+    end
+
+    P --> SA["Group paragraphs by section<br/>(reading order preserved)"]
+    SA --> PK["Pack into ~600-token windows<br/>10–15% overlap, never cross sections"]
+    PK --> HS{"Window over budget?"}
+    HS -->|yes| SP["Hard-split oversized paragraph<br/>into char windows"]
+    HS -->|no| TC["Text ChunkRecord"]
+    SP --> TC
+    TC --> AM["Section anchor map<br/>section_id → first chunk_id"]
+
+    T --> TB["Bundle: caption + Section + Context (neighbors) + Table markdown"]
+    TB --> TBC["Table ChunkRecord<br/>parent_id = anchor for section"]
+
+    I --> IB["Bundle: caption + Section + Surrounding text + Vision description"]
+    IB --> IBC["Image ChunkRecord<br/>parent_id = anchor for section"]
+
+    AM --> TBC
+    AM --> IBC
+
+    TC --> OUT["assemble_chunks → unified list[ChunkRecord]"]
+    TBC --> OUT
+    IBC --> OUT
+
+    OUT --> META["Backfill doc_id, doc_filename, doc_hash<br/>onto every chunk"]
 ```
 
-- **Method:** `_smart_chunk_text` for text; tables + images are kept
-  whole (one chunk each) — they're already self-contained units.
-- **Image chunk content** is built as:
+- **Module:** [`src/chunking.py`](../src/chunking.py) — pure functions, no Azure SDK calls.
+- **Sizing:** defaults `CHUNK_TOKENS=600`, `CHUNK_OVERLAP=80` (~13%, inside the 400–800 / 10–15% target).
+- **Section-aware:** `chunk_paragraphs_by_section` groups paragraphs by their DI `section_id` in reading order, packs into char-bounded windows that **never cross section boundaries**, then drops `pageHeader` / `pageFooter` paragraphs. Returns a `(chunks, section_anchor_map)` tuple — the anchor map is `section_id → first text chunk id` and is what gives table/image chunks their `parent_id`.
+- **Tables — never isolated:** `build_table_chunks` produces:
   ```
-  [Figure on page 4 — Figure 3: System architecture]: <vision description>
+  [Table on page 4 — Caption]
+
+  Section: 3. Architecture > 3.1 Components
+
+  Context:
+  <neighbor paragraph(s) before the table>
+  <neighbor paragraph(s) after>
+
+  Table:
+  <markdown>
   ```
-  This keeps the caption in two embedding-friendly places: the bracketed
-  header *and* the caption-prepended description.
-- **Result:** unified `list[ChunkRecord]`.
+  This means the *explanation* travels with the data into the embedding, fixing the "table chunk has no relation to surrounding text" problem.
+- **Images — caption + surrounding text + description:** `build_image_chunks` produces:
+  ```
+  [Figure on page 15 — Architecture Diagram]
+
+  Section: 6. Architecture Diagram
+
+  Caption: Architecture Diagram
+
+  Surrounding text:
+  <neighbor paragraph(s)>
+
+  Description: <GPT-4o vision output>
+  ```
+- **Multi-document safety:** every chunk carries `doc_id` (UUID), `doc_filename` (the original PDF name), and `doc_hash` (sha256 of source bytes — computed in stage 1). Cross-PDF retrieval, deletion, and dedup all key off these.
+- **Layout / hierarchy fields on every chunk:** `section_id`, `section_path`, `section_level`, `parent_id`, `element_id` (DI ref like `/tables/3`), `bbox` (PDF points), `reading_order`.
+- **Fallback:** if `paragraphs` / `sections` aren't available (e.g. the legacy stub fixtures), `assemble_chunks` falls back to the original per-page sliding window via `chunk_text_pages` — same multi-doc fields are still stamped.
 
 ### Stage 5 — Embed
 
@@ -235,13 +294,18 @@ flowchart LR
 ```
 
 - `create_or_update_index` is called every batch — schema additions
-  (`caption`, `source`) auto-patch on the next ingest.
+  (new layout/hierarchy fields) auto-patch on the next ingest.
 - `model_dump(exclude_none=True)` is used so optional fields
-  (`caption`, `source`, `image_url`) only travel when populated.
+  (`caption`, `source`, `image_url`, `bbox`, `parent_id`, …) only travel
+  when populated.
 - **Indexed fields** (full schema in [architecture.md §10](architecture.md#10-ai-search-index-schema)):
-  - `content`, `caption` → searchable (en.lucene analyzer)
-  - `doc_id`, `page`, `type`, `source` → filterable
-  - `source` → also facetable for analytics
+  - `content`, `caption`, `section_path` → searchable (en.lucene analyzer)
+  - `doc_id`, `doc_filename`, `doc_hash`, `page`, `type`, `source`,
+    `section_id`, `section_level`, `parent_id`, `element_id`,
+    `reading_order` → filterable
+  - `doc_filename`, `source`, `section_path` → also facetable
+  - `reading_order` → sortable (reconstruct doc order from search results)
+  - `bbox` → `Collection(Edm.Double)`, retrievable (for UI highlight)
   - `embedding` → HNSW vector field
   - `image_url` → retrievable only
 
@@ -281,20 +345,32 @@ classDiagram
         +description: str
         +caption: str
         +source: "figure" | "raster"
+        +figure_id?: str
+        +bbox?: list[float]
+        +section_id?, section_path?
+        +neighbor_paragraph_ids: list[str]
     }
     class ChunkRecord {
         +id: uuid
         +doc_id: uuid
+        +doc_filename?: str
+        +doc_hash?: str
         +page, type
         +content: str
         +image_url?: str
         +caption?: str
         +source?: "figure" | "raster"
+        +section_id?, section_path?, section_level?
+        +parent_id?: uuid
+        +element_id?: str
+        +bbox?: list[float]
+        +reading_order?: int
         +embedding?: list[float]
     }
     DocumentMeta "1" --> "*" StageEvent
     DocumentMeta "1" --> "*" ChunkRecord
     ExtractedImage ..> ChunkRecord : becomes (type=image)
+    ChunkRecord "1" --> "0..*" ChunkRecord : parent_id (table/image → section anchor)
 ```
 
 ---
@@ -318,13 +394,11 @@ ingestion view.
 
 ## 6. Quick reference — what changed recently
 
-- DI is now called *without* `features=['figures']` (would be rejected as
-  `InvalidArgument`); `result.figures` is part of standard `prebuilt-layout`
-  output.
-- Image extraction is now **hybrid**: DI figures (rendered) + PyMuPDF
-  rasters (original) with IoU dedup.
-- New chunk fields: `caption` (searchable) and `source` (filterable +
-  facetable, values `"figure"` or `"raster"`).
-- Image chunks now carry the DI caption verbatim in `content` —
-  dramatically improving retrieval recall on questions like *"show the
-  architecture diagram"*.
+- **Section-aware chunking** (May 2026). Chunking is no longer per-page sliding window. `chunk_paragraphs_by_section` packs DI paragraphs into ~600-token windows (10–15% overlap) **never crossing section boundaries**. Defaults moved to `CHUNK_TOKENS=600`, `CHUNK_OVERLAP=80`.
+- **Tables and images are never isolated.** `build_table_chunks` and `build_image_chunks` bundle the caption + 1–2 nearby paragraphs (sourced from DI's `figures_meta` / `tables[].neighbor_paragraph_ids`) directly into the chunk body, so the embedding sees the explanation alongside the data / vision description.
+- **Parent-child links.** Each section emits an "anchor" text chunk; every table / image chunk in that section gets `parent_id = anchor.id`. The UI can now show siblings.
+- **Layout coordinates on every chunk.** `bbox` (PDF points) and `reading_order` are stamped on every text/table/image chunk and indexed (`reading_order` is sortable, so search results can be re-sorted into doc order).
+- **Multi-PDF identity.** `doc_id` (UUID), `doc_filename`, and `doc_hash` (sha256 of source bytes — computed in stage 1) are on every chunk and filterable in AI Search.
+- **Richer DI extraction.** `extract_pdf` now returns `paragraphs`, `sections` (with `level`, `path`, `parent_id`, paragraph/table/figure ids), and `figures_meta`. `figure_id`, `bbox`, `section_*`, `neighbor_paragraph_ids` flow into each emitted image.
+- DI is still called *without* `features=['figures']` (would be rejected as `InvalidArgument`); `result.figures` is part of standard `prebuilt-layout` output.
+- Image extraction is still **hybrid**: DI figures (rendered) + PyMuPDF rasters (original) with IoU dedup.

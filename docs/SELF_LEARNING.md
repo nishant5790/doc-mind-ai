@@ -125,11 +125,11 @@ Pressing **Run Learning Loop** is equivalent to waiting for the worker's hourly 
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Distilled : gpt-4o emits rule from corrections
-    Distilled --> Stored : upsert with deterministic id<br/>(rule-sha1(category:normalized))
-    Stored --> Refreshed : next run on overlapping corpus<br/>(same id → updated_at refresh)
-    Stored --> Injected : RAGEngine.get_rules(top=5)<br/>→ system prompt
-    Stored --> Wiped : Reset Learning button
+    [*] --> Distilled: gpt-4o emits rule from corrections
+    Distilled --> Stored: upsert with deterministic id<br/>rule-sha1 of category plus normalized
+    Stored --> Refreshed: next run on overlapping corpus<br/>same id, updated_at refresh
+    Stored --> Injected: RAGEngine.get_rules top 5<br/>into system prompt
+    Stored --> Wiped: Reset Learning button
     Refreshed --> Injected
     Wiped --> [*]
 ```
