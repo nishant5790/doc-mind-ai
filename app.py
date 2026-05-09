@@ -31,6 +31,7 @@ from src.doc_intelligence import DocIntelService
 from src.models import (
     ChatRequest,
     DocumentMeta,
+    FeedbackChunkMeta,
     FeedbackRecord,
     FeedbackRequest,
     IngestionTask,
@@ -229,6 +230,14 @@ def submit_feedback(req: FeedbackRequest, user_id: str = Depends(current_user)) 
             question=question,
             answer=target.content,
             chunk_ids=[s.chunk_id for s in target.sources],
+            chunk_meta=[
+                FeedbackChunkMeta(
+                    chunk_id=s.chunk_id,
+                    type=s.type or "text",
+                    page=s.page or 0,
+                )
+                for s in target.sources
+            ],
         )
     )
 

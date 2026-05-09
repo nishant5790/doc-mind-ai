@@ -38,6 +38,10 @@ ENDPOINT: str = os.environ["AZURE_SEARCH_SERVICE_ENDPOINT"]
 ADMIN_KEY: str | None = os.environ.get("AZURE_SEARCH_ADMIN_KEY")
 INDEX_NAME: str = os.environ.get("AZURE_SEARCH_INDEX_NAME", "pdg-was-multimodal-rag-2")
 API_VERSION: str = "2024-05-01-preview"
+# Name of the semantic configuration attached to the index. Used by the L2
+# reranker to reorder hybrid results so the right chunks from the right PDF
+# rise to the top instead of mixing across documents.
+SEMANTIC_CONFIG_NAME: str = os.environ.get("AZURE_SEARCH_SEMANTIC_CONFIG", "semantic-config")
 
 # Azure Blob Storage
 STORAGE_ACCOUNT: str = os.environ["AZURE_STORAGE_ACCOUNT_NAME"]
