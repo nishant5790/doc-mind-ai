@@ -69,15 +69,115 @@ class LearningLoop:
         return stats
 
     # ------------------------------------------------------------------
+    # Words that strongly suggest a 👎 + correction is about *answer style*
+    # (formatting, length, tone) rather than the chunks themselves being
+    # wrong. We use them to skip the chunk-quality downgrade so that asking
+    # "format this as bullets" doesn't permanently retire the source chunks.
+    _STYLE_CORRECTION_HINTS = (
+        "bullet", "bulleted", "bullet point", "bullet points",
+        "format", "formatting", "structure", "structured",
+        "concise", "shorter", "longer", "detail", "detailed", "in detail",
+        "tone", "polite", "friendly", "language", "rewrite", "reword",
+        "table", "list", "paragraph", "headings", "heading", "step by step",
+        "numbered", "summary", "summarise", "summarize",
+    )
+    _REMOVAL_INTENT_HINTS = (
+        "remove", "don't show", "do not show", "dont show",
+        "don't include", "do not include", "dont include",
+        "unnecessary", "unneccessary", "irrelevant", "unrelated",
+        "not needed", "not relevant", "drop", "hide", "exclude",
+        "shouldn't reference", "should not reference",
+    )
+    # Map user-facing modality words to ChunkRecord.type values.
+    _MODALITY_WORDS = {
+        "image": "image", "images": "image",
+        "figure": "image", "figures": "image",
+        "diagram": "image", "diagrams": "image",
+        "chart": "image", "charts": "image",
+        "picture": "image", "pictures": "image",
+        "screenshot": "image", "screenshots": "image",
+        "photo": "image", "photos": "image",
+        "table": "table", "tables": "table",
+        "text": "text", "paragraph": "text", "paragraphs": "text",
+    }
+
+    @classmethod
+    def _is_style_only_correction(cls, correction: str) -> bool:
+        if not correction:
+            return False
+        c = correction.lower()
+        if any(h in c for h in cls._REMOVAL_INTENT_HINTS):
+            # Removal intent dominates — even if it also mentions a
+            # style-ish word, treat it as a content correction.
+            return False
+        return any(h in c for h in cls._STYLE_CORRECTION_HINTS)
+
+    @classmethod
+    def _removal_target_types(cls, correction: str) -> set[str]:
+        """Return chunk types the user explicitly asked to drop, or empty
+        set if the correction has no removal intent.
+
+        E.g. 'remove the image on page 11 that is unnecessary' -> {'image'}.
+        """
+        if not correction:
+            return set()
+        c = correction.lower()
+        if not any(h in c for h in cls._REMOVAL_INTENT_HINTS):
+            return set()
+        targets: set[str] = set()
+        for word, modality in cls._MODALITY_WORDS.items():
+            if re.search(rf"\b{re.escape(word)}\b", c):
+                targets.add(modality)
+        return targets
+
+    # ------------------------------------------------------------------
     def _update_chunk_quality(self, feedback: list[FeedbackRecord]) -> int:
         n = 0
         for fb in feedback:
+            correction = fb.correction or ""
+            # 1) Style-only correction — chunks were fine, only formatting
+            #    was off. Don't penalize anything.
+            if fb.rating == "down" and self._is_style_only_correction(correction):
+                log.info(
+                    "Skipping chunk-quality downgrade for style-only "
+                    "correction on feedback %s",
+                    getattr(fb, "id", "?"),
+                )
+                continue
+
+            # 2) Targeted removal correction (e.g. 'remove the image on
+            #    page 6 that is unnecessary') — only penalize chunks whose
+            #    type matches the removed modality. We need chunk_meta for
+            #    this; if the feedback row pre-dates that field we fall
+            #    back to penalizing all cited chunks.
+            target_types: set[str] = set()
+            if fb.rating == "down" and fb.chunk_meta:
+                target_types = self._removal_target_types(correction)
+
             for cid in fb.chunk_ids:
                 if fb.rating == "up":
                     self.cosmos.update_chunk_quality(cid, good=True)
+                    n += 1
+                    continue
+
+                if target_types:
+                    meta = next(
+                        (m for m in fb.chunk_meta if m.chunk_id == cid),
+                        None,
+                    )
+                    if meta and meta.type not in target_types:
+                        # User asked to drop a different modality — leave
+                        # this chunk's quality alone.
+                        continue
+                    # Match (or no meta): apply a stronger negative
+                    # signal so a single explicit removal request is
+                    # enough to retire the offending chunk.
+                    self.cosmos.update_chunk_quality(cid, bad=True)
+                    self.cosmos.update_chunk_quality(cid, bad=True)
+                    n += 2
                 else:
                     self.cosmos.update_chunk_quality(cid, bad=True)
-                n += 1
+                    n += 1
         return n
 
     # ------------------------------------------------------------------

@@ -48,9 +48,14 @@ from azure.search.documents.indexes.models import (
     VectorSearch,
     VectorSearchAlgorithmConfiguration,
     HnswAlgorithmConfiguration,
+    ExhaustiveKnnAlgorithmConfiguration  ,
     VectorSearchProfile,
+    SemanticConfiguration,
+    SemanticField,
+    SemanticPrioritizedFields,
+    SemanticSearch,
 )
-from azure.search.documents.models import VectorizedQuery
+from azure.search.documents.models import VectorizedQuery, QueryType
 
 import config
 from src.models import ChunkRecord, Source
@@ -109,13 +114,35 @@ class SearchService:
         ]
 
         vector_search = VectorSearch(
-            algorithms=[HnswAlgorithmConfiguration(name=algo_config)],
+            algorithms=[HnswAlgorithmConfiguration(name=algo_config),
+                        ExhaustiveKnnAlgorithmConfiguration(name="my-eknn-vector-config", kind="exhaustiveKnn") ],
             profiles=[
                 VectorSearchProfile(name=vector_profile, algorithm_configuration_name=algo_config)
             ],
         )
 
-        index = SearchIndex(name=self.index_name, fields=fields, vector_search=vector_search)
+        # Semantic configuration — used by the L2 reranker to promote the most
+        # relevant chunks. Prioritising `section_path` as the title field and
+        # `doc_filename` as a keyword keeps each chunk anchored to its own
+        # document, which reduces cross-PDF mixing in top results.
+        semantic_config = SemanticConfiguration(
+            name=config.SEMANTIC_CONFIG_NAME,
+            prioritized_fields=SemanticPrioritizedFields(
+                title_field=SemanticField(field_name="section_path"),
+                keywords_fields=[
+                    SemanticField(field_name="doc_filename"),
+                ],
+                content_fields=[SemanticField(field_name="content")],
+            ),
+        )
+        semantic_search = SemanticSearch(configurations=[semantic_config])
+
+        index = SearchIndex(
+            name=self.index_name,
+            fields=fields,
+            vector_search=vector_search,
+            semantic_search=semantic_search,
+        )
         self._index_client.create_or_update_index(index)
         log.info("AI Search index '%s' is ready", self.index_name)
 
@@ -159,6 +186,9 @@ class SearchService:
             vector_queries=[vector_query],
             filter=filter_expr,
             top=top_k,
+            query_type=QueryType.SEMANTIC,
+            semantic_configuration_name=config.SEMANTIC_CONFIG_NAME,
+            query_caption="extractive",
             select=[
                 "id", "doc_id", "doc_filename", "page", "type", "content",
                 "image_url", "caption", "source",
@@ -170,6 +200,22 @@ class SearchService:
         sources: list[Source] = []
         for r in results:
             log.debug("Raw search result: %s", r)
+            # Prefer the semantic reranker score when available so downstream
+            # ranking reflects L2 relevance rather than raw BM25/vector score.
+            reranker_score = r.get("@search.reranker_score")
+            score = reranker_score if reranker_score is not None else r.get("@search.score")
+
+            # If a semantic caption came back, surface the highlighted/extracted
+            # snippet — it is usually a tighter, more on-topic excerpt than the
+            # raw chunk content.
+            snippet = (r.get("content") or "")[:400]
+            captions = r.get("@search.captions") or []
+            if captions:
+                cap = captions[0]
+                cap_text = getattr(cap, "highlights", None) or getattr(cap, "text", None)
+                if cap_text:
+                    snippet = cap_text[:400]
+
             sources.append(
                 Source(
                     chunk_id=r["id"],
@@ -177,13 +223,13 @@ class SearchService:
                     doc_filename=r.get("doc_filename"),
                     page=r.get("page", 0),
                     type=r.get("type", "text"),
-                    snippet=(r.get("content") or "")[:400],
+                    snippet=snippet,
                     image_url=r.get("image_url"),
                     caption=r.get("caption"),
                     source=r.get("source"),
                     section_path=r.get("section_path"),
                     parent_id=r.get("parent_id"),
-                    score=r.get("@search.score"),
+                    score=score,
                 )
             )
         return sources

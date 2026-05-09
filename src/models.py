@@ -159,6 +159,16 @@ class FeedbackRequest(BaseModel):
     correction: Optional[str] = None  # free-text correction from user
 
 
+class FeedbackChunkMeta(BaseModel):
+    """Lightweight chunk metadata captured at feedback time so the
+    learning loop can target penalties by modality / page without having
+    to re-query the search index."""
+
+    chunk_id: str
+    type: str = "text"  # "text" | "table" | "image"
+    page: int = 0
+
+
 class FeedbackRecord(BaseModel):
     id: str = Field(default_factory=_new_id)
     session_id: str
@@ -169,6 +179,10 @@ class FeedbackRecord(BaseModel):
     question: str = ""
     answer: str = ""
     chunk_ids: list[str] = Field(default_factory=list)
+    # Per-chunk metadata (type, page) for the chunks cited in the answer.
+    # Older feedback rows may not have this populated — code that uses it
+    # MUST tolerate an empty list.
+    chunk_meta: list[FeedbackChunkMeta] = Field(default_factory=list)
     created_at: str = Field(default_factory=_utcnow)
 
 

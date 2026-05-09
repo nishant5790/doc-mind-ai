@@ -164,7 +164,7 @@ class RAGEngine:
                 img_sources = self.azsearch.search(
                     question,
                     embedding,
-                    top_k=3,
+                    top_k=1,
                     doc_ids=doc_ids,
                     type_filter="image",
                 )
@@ -208,23 +208,32 @@ class RAGEngine:
                 quality[s.chunk_id] = 0.5  # neutral default for unjudged chunks
 
         # Feedback-driven filter: drop chunks the system has *already learned*
-        # are bad for this kind of question. We only drop chunks that have
-        # received explicit feedback (good+bad > 0) — never unjudged chunks —
-        # so a single 👎 is enough to retire a clearly irrelevant image.
+        # are bad. We only drop chunks that have actually received negative
+        # signal (times_in_bad_answer > 0) and whose quality is below the
+        # configured threshold. We also never drop the LAST surviving
+        # source — if every chunk would be filtered, keep them all so the
+        # model still has context to answer with.
         def _is_learned_bad(s: Source) -> bool:
             cq = self.cosmos.get_chunk_quality(s.chunk_id)
             if not cq:
                 return False
-            judged = cq.times_in_good_answer + cq.times_in_bad_answer
-            return judged > 0 and cq.quality_score < self._BAD_QUALITY_THRESHOLD
+            if cq.times_in_bad_answer < 1:
+                return False
+            return cq.quality_score < self._BAD_QUALITY_THRESHOLD
 
         filtered = [s for s in sources if not _is_learned_bad(s)]
-        if len(filtered) != len(sources):
+        if filtered and len(filtered) != len(sources):
             log.info(
                 "Filtered %d learned-bad chunk(s) from results",
                 len(sources) - len(filtered),
             )
             sources = filtered
+        elif not filtered and sources:
+            log.info(
+                "All %d source(s) flagged learned-bad — keeping them rather "
+                "than answering with no context",
+                len(sources),
+            )
 
         sources.sort(key=lambda s: quality.get(s.chunk_id, 0.5), reverse=True)
         return sources
