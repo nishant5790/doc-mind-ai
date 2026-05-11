@@ -21,7 +21,19 @@ from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
 
 # Logging
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+# Set LOG_LEVEL=DEBUG (or LEARNING_LOG_LEVEL=DEBUG for just the learning
+# loop) in your environment / .env to see verbose step-by-step output.
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, _LOG_LEVEL, logging.INFO),
+                    format="%(levelname)s %(name)s: %(message)s")
+
+# Allow scoping a more verbose level for just the learning loop without
+# making the whole app chatty: LEARNING_LOG_LEVEL=DEBUG.
+_LEARNING_LOG_LEVEL = os.environ.get("LEARNING_LOG_LEVEL")
+if _LEARNING_LOG_LEVEL:
+    logging.getLogger("src.learning").setLevel(
+        getattr(logging, _LEARNING_LOG_LEVEL.upper(), logging.INFO)
+    )
 
 # Truststore (inject corporate CA certs into Python SSL)
 try:

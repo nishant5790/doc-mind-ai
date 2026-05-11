@@ -52,7 +52,14 @@ class LearningLoop:
     # ------------------------------------------------------------------
     def run_once(self) -> dict:
         """Run all three learning layers. Returns a stats summary."""
+        log.debug("[run_once] starting learning loop")
         feedback = self.cosmos.list_feedback(limit=200)
+        log.debug(
+            "[run_once] fetched %d feedback records (up=%d, down=%d)",
+            len(feedback),
+            sum(1 for f in feedback if f.rating == "up"),
+            sum(1 for f in feedback if f.rating == "down"),
+        )
         stats = {
             "feedback_count": len(feedback),
             "rules_added": 0,
@@ -60,10 +67,14 @@ class LearningLoop:
             "chunk_updates": 0,
         }
         if not feedback:
+            log.debug("[run_once] no feedback to process — exiting early")
             return stats
 
+        log.debug("[run_once] -> Layer 2: chunk-quality update")
         stats["chunk_updates"] = self._update_chunk_quality(feedback)
+        log.debug("[run_once] -> Layer 1: rule distillation")
         stats["rules_added"] = self._distil_rules(feedback)
+        log.debug("[run_once] -> Layer 3: golden Q&A promotion")
         stats["golden_added"] = self._promote_golden(feedback)
         log.info("Learning loop done: %s", stats)
         return stats
@@ -134,14 +145,19 @@ class LearningLoop:
     def _update_chunk_quality(self, feedback: list[FeedbackRecord]) -> int:
         n = 0
         for fb in feedback:
+            fb_id = getattr(fb, "id", "?")
             correction = fb.correction or ""
+            log.debug(
+                "[chunk_quality] fb=%s rating=%s chunk_ids=%d correction=%r",
+                fb_id, fb.rating, len(fb.chunk_ids), correction[:120],
+            )
             # 1) Style-only correction — chunks were fine, only formatting
             #    was off. Don't penalize anything.
             if fb.rating == "down" and self._is_style_only_correction(correction):
                 log.info(
                     "Skipping chunk-quality downgrade for style-only "
                     "correction on feedback %s",
-                    getattr(fb, "id", "?"),
+                    fb_id,
                 )
                 continue
 
@@ -153,9 +169,15 @@ class LearningLoop:
             target_types: set[str] = set()
             if fb.rating == "down" and fb.chunk_meta:
                 target_types = self._removal_target_types(correction)
+                if target_types:
+                    log.debug(
+                        "[chunk_quality] fb=%s removal-intent target_types=%s",
+                        fb_id, target_types,
+                    )
 
             for cid in fb.chunk_ids:
                 if fb.rating == "up":
+                    log.debug("[chunk_quality] +good chunk=%s (fb=%s)", cid, fb_id)
                     self.cosmos.update_chunk_quality(cid, good=True)
                     n += 1
                     continue
@@ -168,16 +190,26 @@ class LearningLoop:
                     if meta and meta.type not in target_types:
                         # User asked to drop a different modality — leave
                         # this chunk's quality alone.
+                        log.debug(
+                            "[chunk_quality] skip chunk=%s type=%s not in %s",
+                            cid, meta.type, target_types,
+                        )
                         continue
                     # Match (or no meta): apply a stronger negative
                     # signal so a single explicit removal request is
                     # enough to retire the offending chunk.
+                    log.debug(
+                        "[chunk_quality] ++bad (x2) chunk=%s (fb=%s, removal)",
+                        cid, fb_id,
+                    )
                     self.cosmos.update_chunk_quality(cid, bad=True)
                     self.cosmos.update_chunk_quality(cid, bad=True)
                     n += 2
                 else:
+                    log.debug("[chunk_quality] +bad chunk=%s (fb=%s)", cid, fb_id)
                     self.cosmos.update_chunk_quality(cid, bad=True)
                     n += 1
+        log.debug("[chunk_quality] done — %d updates applied", n)
         return n
 
     # ------------------------------------------------------------------
@@ -187,10 +219,12 @@ class LearningLoop:
             for f in feedback
             if f.rating == "down" and f.correction
         ]
+        log.debug("[distil_rules] %d corrections eligible", len(corrections))
         if not corrections:
             return 0
 
         prompt = DISTIL_PROMPT + "\n---\n".join(corrections[-30:])
+        log.debug("[distil_rules] prompt size=%d chars", len(prompt))
         try:
             content = self.openai.chat(
                 [
@@ -200,8 +234,10 @@ class LearningLoop:
                 temperature=0.0,
                 max_tokens=400,
             )
+            log.debug("[distil_rules] LLM raw response: %s", content[:500])
             data = json.loads(self._strip_fences(content))
             rules: list[str] = data.get("rules", [])
+            log.debug("[distil_rules] parsed %d rules from LLM", len(rules))
         except Exception as e:
             log.warning("Rule distillation failed: %s", e)
             return 0
@@ -218,8 +254,10 @@ class LearningLoop:
             category = "general"
             rule_id = self._rule_id(category, norm)
             if rule_id in seen_ids:
+                log.debug("[distil_rules] dedup skip rule_id=%s", rule_id)
                 continue
             seen_ids.add(rule_id)
+            log.debug("[distil_rules] saving rule_id=%s text=%r", rule_id, text)
             self.cosmos.save_rule(
                 LearnedRule(
                     id=rule_id,
@@ -230,13 +268,19 @@ class LearningLoop:
                 )
             )
             added += 1
+        log.debug("[distil_rules] added=%d", added)
         return added
 
     # ------------------------------------------------------------------
     def _promote_golden(self, feedback: list[FeedbackRecord]) -> int:
         n = 0
         for fb in feedback:
+            fb_id = getattr(fb, "id", "?")
             if fb.rating == "up" and fb.question and fb.answer:
+                log.debug(
+                    "[promote_golden] saving fb=%s q=%r",
+                    fb_id, (fb.question or "")[:80],
+                )
                 self.cosmos.save_golden(
                     GoldenPair(
                         topic="general",
@@ -246,6 +290,12 @@ class LearningLoop:
                     )
                 )
                 n += 1
+            else:
+                log.debug(
+                    "[promote_golden] skip fb=%s rating=%s has_q=%s has_a=%s",
+                    fb_id, fb.rating, bool(fb.question), bool(fb.answer),
+                )
+        log.debug("[promote_golden] added=%d", n)
         return n
 
     # ------------------------------------------------------------------
